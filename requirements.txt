@@ -1,0 +1,9 @@
+google-genai
+PyMuPDF
+img2pdf
+pydantic
+python-dotenv
+Pillow
+boto3
+pandas
+openpyxl

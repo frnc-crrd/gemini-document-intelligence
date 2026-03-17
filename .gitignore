@@ -1,0 +1,59 @@
+﻿# ==============================================================================
+# @file         .gitignore
+# @brief        Enterprise-grade Git exclusion rules for Fedora Workstation.
+# @description  Optimized for Python (UV/Mise), AI workflows, and VS Code.
+# ==============================================================================
+
+# --- OS & SYSTEM METADATA ---
+# Archivos temporales de Linux/GNOME y otros SO
+.DS_Store
+Thumbs.db
+.directory
+*~
+*.swp
+*.tmp
+.fuse_hidden*
+
+# --- IDE & EDITORS (VS Code & Others) ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# --- PYTHON ECOSYSTEM (UV & Mise) ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- PROJECT DATA & AI ARTIFACTS ---
+# Bloqueamos toda la carpeta data para evitar fugas de información sensible.
+# Es preferible que data/ sea un volumen externo o ignorado por completo.
+data/
+outputs/
+logs/
+*.log
+
+# Binarios pesados (Uso de regex para cubrir mayúsculas/minúsculas en Linux)
+*.[pP][dD][fF]
+*.[jJ][pP][eE][gG]
+*.[jJ][pP][gG]
+*.[pP][nN][gG]
+*.[xX][lL][sS][xX]
+*.[cC][sS][vV]
+
+# --- LOCAL CONFIGURATION & SECRETS ---
+.env
+.env.local
+.env.*.local
+.mise.local.toml
