@@ -1,54 +1,72 @@
-"""Script de limpieza del entorno de trabajo.
+"""Script de limpieza transaccional del entorno de trabajo.
 
-Elimina los archivos generados en ejecuciones previas dentro de los 
-directorios de explosión y resultados finales. 
-Protege y conserva el archivo de contexto (system_context.json) para 
-permitir el aprendizaje continuo y la evolución orgánica de la IA.
+Provee un mecanismo seguro para purgar directorios temporales y cachés
+de ejecuciones previas, garantizando la inmutabilidad de la memoria
+histórica (contexto de la IA).
 """
 
 import shutil
+import sys
 from pathlib import Path
-from src import config
 
-def clean_directory(directory: Path) -> None:
-    """Elimina recursivamente un directorio y lo vuelve a crear vacío.
+from src.config import get_settings
+from src.core.logger import get_system_logger
+
+logger = get_system_logger(__name__)
+settings = get_settings()
+
+
+def safe_clean_directory(directory: Path) -> None:
+    """Elimina recursivamente un directorio y lo recrea vacío de forma segura.
 
     Args:
-        directory: Objeto Path que apunta al directorio a limpiar.
+        directory: Objeto Path que apunta al directorio objetivo.
     """
     if directory.exists():
         try:
             shutil.rmtree(directory)
-            print(f"Directorio limpiado: {directory.name}/")
-        except Exception as e:
-            print(f"Error al limpiar {directory.name}/: {str(e)}")
+            logger.debug(f"Directorio purgado exitosamente: {directory.name}/")
+        except PermissionError as e:
+            logger.error(f"Fallo de permisos al intentar limpiar {directory.name}/. ¿Archivo en uso?: {e}")
+            return
+        except OSError as e:
+            logger.error(f"Error de sistema operativo al acceder a {directory.name}/: {e}")
             return
 
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.error(f"Imposible recrear la estructura de directorio {directory.name}/: {e}")
 
-def main():
-    """Ejecuta la rutina de limpieza protegiendo la memoria histórica."""
-    print("=" * 50)
-    print("LIMPIEZA DE ENTORNO DE PROCESAMIENTO")
-    print("=" * 50)
+
+def execute_cleanup() -> None:
+    """Ejecuta la rutina de purga de áreas de stage protegiendo la persistencia de IA."""
+    logger.info("Iniciando secuencia de limpieza del entorno de procesamiento.")
 
     directories_to_clean = [
-        config.EXPLOSION_DIR,
-        config.FINAL_DIR
+        settings.explosion_dir,
+        settings.final_dir
     ]
 
     for directory in directories_to_clean:
-        clean_directory(directory)
+        safe_clean_directory(directory)
 
-    context_file = config.DATA_DIR / "system_context.json"
+    # Verificación explícita de la memoria histórica
+    context_file = settings.data_dir / "system_context.json"
     if context_file.exists():
-        print(f"Memoria histórica protegida: {context_file.name} conservado para aprendizaje continuo.")
+        logger.info(f"Memoria histórica detectada y protegida: {context_file.name} conservado para aprendizaje continuo.")
     else:
-        print("No se encontró memoria histórica. Se creará una nueva en la próxima ejecución.")
+        logger.info("Memoria histórica no detectada. Se inicializará un nuevo catálogo en la próxima ejecución.")
 
-    print("-" * 50)
-    print("Entorno listo. Puedes ejecutar main.py sin perder el conocimiento adquirido.")
-    print("=" * 50)
+    logger.info("Rutina de limpieza finalizada. Entorno transaccional listo.")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        execute_cleanup()
+    except KeyboardInterrupt:
+        logger.warning("Rutina de limpieza interrumpida por el usuario.")
+        sys.exit(130)
+    except Exception as e:
+        logger.critical(f"Fallo catastrófico no controlado en la rutina de limpieza: {e}", exc_info=True)
+        sys.exit(1)

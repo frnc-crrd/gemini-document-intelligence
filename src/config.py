@@ -1,44 +1,115 @@
-"""Configuración central del proyecto.
+"""Configuración central del sistema de Auditoría CxC.
 
-Maneja variables de entorno, rutas de trabajo, configuraciones de la API de Gemini
-y catálogos estáticos del sistema.
+Implementa validación estricta de variables de entorno utilizando Pydantic.
+Garantiza que el sistema falle de manera temprana si las credenciales o
+configuraciones críticas no están presentes en el entorno de ejecución.
 """
 
-import os
 from pathlib import Path
-from dotenv import load_dotenv
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-load_dotenv()
 
-# ============================================================
-# API KEYS Y MODELO
-# ============================================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"
+class Settings(BaseSettings):
+    """Definición estricta y tipada de la configuración del sistema.
+    
+    Attributes:
+        gemini_api_key: Credencial requerida para el consumo del modelo.
+        gemini_model: Identificador del modelo fundacional a utilizar.
+        execution_mode: Entorno de despliegue ('local' o 'cloud').
+        aws_bucket_name: Identificador del bucket para almacenamiento remoto.
+        dpi_conversion: Resolución estándar para la rasterización de documentos.
+        max_retries: Límite de intentos para tolerancia a fallos de red.
+        api_delay: Tiempo de espera base para el backoff exponencial.
+        error_no_detectado: Etiqueta estándar para documentos sin folio.
+        error_ilegible: Etiqueta estándar para documentos no procesables.
+    """
 
-# ============================================================
-# MODO DE EJECUCIÓN (LOCAL vs CLOUD)
-# ============================================================
-EXECUTION_MODE = os.getenv("EXECUTION_MODE", "local").lower()
-AWS_BUCKET_NAME = os.getenv("AWS_BUCKET_NAME", "tu-bucket-produccion")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
-# ============================================================
-# RUTAS DE TRABAJO
-# ============================================================
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+    # Autenticación y Modelos
+    gemini_api_key: str = Field(
+        ..., 
+        description="Clave de API obligatoria para Google Gemini."
+    )
+    gemini_model: str = Field(
+        default="gemini-2.5-flash", 
+        description="Modelo de procesamiento primario."
+    )
 
-RAW_DIR = DATA_DIR / "01_raw"
-EXPLOSION_DIR = DATA_DIR / "02_explosion"
-FINAL_DIR = DATA_DIR / "03_final"
+    # Entorno de Ejecución
+    execution_mode: str = Field(
+        default="local", 
+        description="Define el comportamiento del almacenamiento (local/cloud)."
+    )
+    aws_bucket_name: str = Field(
+        default="tu-bucket-produccion", 
+        description="Bucket S3 destino cuando execution_mode='cloud'."
+    )
 
-# ============================================================
-# CONFIGURACIÓN DE PROCESAMIENTO
-# ============================================================
-DPI_CONVERSION = 200
-MAX_RETRIES = 3
-API_DELAY = 0.5
+    # Parámetros de Procesamiento
+    dpi_conversion: int = Field(
+        default=200, 
+        ge=72, 
+        le=600, 
+        description="Resolución de rasterización (DPI)."
+    )
+    max_retries: int = Field(
+        default=3, 
+        ge=1, 
+        description="Límite máximo de reintentos para peticiones externas."
+    )
+    api_delay: float = Field(
+        default=0.5, 
+        ge=0.1, 
+        description="Segundos base para pausas entre peticiones."
+    )
 
-# Categorías de error estándar
-ERROR_NO_DETECTADO = "ERROR_SIN_FOLIO"
-ERROR_ILEGIBLE = "ERROR_DOCUMENTO_ILEGIBLE"
+    # Constantes de Estado
+    error_no_detectado: str = Field(default="ERROR_SIN_FOLIO")
+    error_ilegible: str = Field(default="ERROR_DOCUMENTO_ILEGIBLE")
+
+    @property
+    def base_dir(self) -> Path:
+        """Calcula el directorio raíz del proyecto dinámicamente.
+        
+        Returns:
+            Path: Ruta absoluta a la raíz del proyecto.
+        """
+        # Resolviendo: src/config.py -> src/ -> raiz/
+        return Path(__file__).resolve().parent.parent
+
+    @property
+    def data_dir(self) -> Path:
+        """Ruta al directorio de persistencia de datos local."""
+        return self.base_dir / "data"
+
+    @property
+    def raw_dir(self) -> Path:
+        """Ruta al directorio de ingesta de documentos crudos."""
+        return self.data_dir / "01_raw"
+
+    @property
+    def explosion_dir(self) -> Path:
+        """Ruta al directorio de almacenamiento temporal por página."""
+        return self.data_dir / "02_explosion"
+
+    @property
+    def final_dir(self) -> Path:
+        """Ruta al directorio de documentos procesados y unificados."""
+        return self.data_dir / "03_final"
+
+
+# Se retrasa la instanciación para permitir la carga de variables
+# en el entorno de pruebas antes de evaluar las validaciones.
+def get_settings() -> Settings:
+    """Instancia y retorna la configuración validada del sistema.
+    
+    Returns:
+        Settings: Objeto con la configuración validada.
+    """
+    return Settings()

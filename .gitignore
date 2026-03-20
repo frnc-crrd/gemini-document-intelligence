@@ -2,6 +2,7 @@
 # @file         .gitignore
 # @brief        Enterprise-grade Git exclusion rules for Fedora Workstation.
 # @description  Optimized for Python (UV/Mise), AI workflows, and VS Code.
+# @version      1.1.0
 # ==============================================================================
 
 # --- OS & SYSTEM METADATA ---
@@ -37,14 +38,16 @@ env/
 .ipynb_checkpoints/
 
 # --- PROJECT DATA & AI ARTIFACTS ---
-# Bloqueamos toda la carpeta data para evitar fugas de información sensible.
-# Es preferible que data/ sea un volumen externo o ignorado por completo.
+# Bloqueamos carpetas de entrada/salida para evitar fugas de información.
 data/
 outputs/
 logs/
 *.log
 
-# Binarios pesados (Uso de regex para cubrir mayúsculas/minúsculas en Linux)
+# Contexto de proyecto y documentación interna (exclusión específica)
+contexto_proyecto.txt
+
+# Binarios pesados y documentos (Case-insensitive para compatibilidad total)
 *.[pP][dD][fF]
 *.[jJ][pP][eE][gG]
 *.[jJ][pP][gG]
@@ -57,3 +60,8 @@ logs/
 .env.local
 .env.*.local
 .mise.local.toml
+
+# --- BUILD & DIST ---
+dist/
+build/
+*.egg-info/
