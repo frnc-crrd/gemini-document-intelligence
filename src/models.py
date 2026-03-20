@@ -5,12 +5,12 @@ las entradas y salidas del pipeline Multi-Agente (GenAI). Estas clases definen
 el contrato de datos estricto que la inteligencia artificial debe respetar.
 """
 
-from typing import List, Optional
-from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Optional, Literal
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 # ==========================================
-# ESQUEMAS: AGENTE 1 (ESPACIAL)
+# ESQUEMAS: AGENTE 1 (ESPACIAL OCR-AWARE)
 # ==========================================
 
 class PageOrientation(BaseModel):
@@ -22,10 +22,22 @@ class PageOrientation(BaseModel):
         ..., 
         description="Identificador exacto del nombre de archivo analizado."
     )
-    orientacion: str = Field(
+    rotation_degrees: int = Field(
         ..., 
-        description="Dirección física de lectura. Valores permitidos: 'NORMAL', 'ACOSTADO_IZQUIERDA', 'ACOSTADO_DERECHA', 'INVERTIDO'."
+        description="Grados de rotación en sentido horario necesarios (0, 90, 180 o 270)."
     )
+    reasoning: str = Field(
+        ..., 
+        description="Justificación técnica de la rotación basada en anclas de texto, metadatos fiscales o códigos QR."
+    )
+
+    @field_validator('rotation_degrees')
+    @classmethod
+    def validate_rotation(cls, v: int) -> int:
+        """Fuerza la validación de rotaciones permitidas evadiendo errores del SDK de GenAI."""
+        if v not in (0, 90, 180, 270):
+            raise ValueError("La rotación debe ser exactamente 0, 90, 180 o 270 grados.")
+        return v
 
 
 class OrientationResponse(BaseModel):
@@ -40,8 +52,27 @@ class OrientationResponse(BaseModel):
 
 
 # ==========================================
-# ESQUEMAS: AGENTE 2 (AUDITOR)
+# ESQUEMAS: AGENTE 2 (AUDITOR Y SECUENCIADOR)
 # ==========================================
+
+class PageRole(BaseModel):
+    """Clasificación topológica estricta para evaluación de límites de documento."""
+    
+    model_config = ConfigDict(strict=True)
+    
+    file_name: str = Field(
+        ..., 
+        description="Nombre del archivo físico evaluado."
+    )
+    role: Literal['INICIO', 'INTERMEDIA', 'CIERRE', 'UNICA', 'HUERFANA'] = Field(
+        ..., 
+        description="Clasificación posicional estricta dentro del documento lógico."
+    )
+    evidence: str = Field(
+        ..., 
+        description="Evidencia visual detectada (ej. 'Leyenda FACTURA en encabezado', 'Sello digital en footer')."
+    )
+
 
 class LogicalDocExtraction(BaseModel):
     """Modelo de extracción semántica que agrupa páginas en una entidad lógica."""
@@ -52,9 +83,13 @@ class LogicalDocExtraction(BaseModel):
         ..., 
         description="Arreglo de folios detectados. Incluye todos los impresos si es un reporte o diario."
     )
+    page_roles: List[PageRole] = Field(
+        ..., 
+        description="Evaluación de límites: Clasificación topológica y evidencia por cada página asignada a este folio."
+    )
     ordered_file_names: List[str] = Field(
         ..., 
-        description="Nombres de archivo en estricto orden cronológico de lectura documental (sellos SAT al final)."
+        description="Nombres de archivo ordenados lógicamente aplicando la regla: INICIO -> INTERMEDIAS -> CIERRE."
     )
     document_type: str = Field(
         ..., 
@@ -106,7 +141,7 @@ class LogicalDocument(BaseModel):
     model_config = ConfigDict(strict=True)
     
     folios: List[str] = Field(..., description="Identificadores del documento.")
-    pages: List[PageInstruction] = Field(..., description="Secuencia de páginas con instrucciones de corrección espacial.")
+    pages: List[PageInstruction] = Field(..., description="Secuencia de páginas ordenadas y con instrucciones de corrección espacial.")
     document_type: str = Field(..., description="Tipo de documento determinado por la IA.")
     client_name: Optional[str] = Field(None, description="Cliente asociado.")
     confidence_score: int = Field(..., description="Nivel de confianza general de la extracción.")

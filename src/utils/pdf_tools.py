@@ -1,8 +1,8 @@
 """Herramientas para manipulación física de archivos PDF e imágenes.
 
 Provee métodos seguros para explotar documentos multipágina, aplicar
-transformaciones espaciales y reconstruir ensamblajes. Implementa
-estrictamente manejadores de contexto para prevenir fugas de memoria
+transformaciones espaciales permanentes (Physical Mutation) y reconstruir ensamblajes.
+Implementa estrictamente manejadores de contexto para prevenir fugas de memoria
 durante las interacciones con PyMuPDF (fitz).
 """
 
@@ -21,18 +21,7 @@ class PDFToolbox:
 
     @staticmethod
     def explode_pdf(input_path: Path, output_dir: Path) -> List[Path]:
-        """Separa un PDF en archivos individuales de una sola página.
-
-        Args:
-            input_path: Ruta al archivo PDF físico origen.
-            output_dir: Directorio destino para las páginas generadas.
-
-        Returns:
-            List[Path]: Lista de rutas físicas de las páginas extraídas.
-            
-        Raises:
-            RuntimeError: Si ocurre un fallo a nivel del motor PDF.
-        """
+        """Separa un PDF en archivos individuales de una sola página."""
         generated_files: List[Path] = []
         base_name = input_path.stem.replace(" ", "_")
         
@@ -61,16 +50,37 @@ class PDFToolbox:
         return generated_files
 
     @staticmethod
-    def wrap_image_to_pdf(image_path: Path, output_dir: Path) -> Path:
-        """Convierte una imagen a un documento PDF de una sola página.
+    def apply_physical_rotation(pdf_path: Path, degrees: int) -> None:
+        """Aplica una rotación física permanente a un archivo PDF en disco.
+        
+        Garantiza que las siguientes fases operen sobre un artefacto nativamente alineado,
+        eliminando la necesidad de transformaciones espaciales durante el reensamblaje.
 
         Args:
-            image_path: Ruta a la imagen original (JPG, PNG).
-            output_dir: Directorio de destino.
-
-        Returns:
-            Path: Ruta del nuevo archivo PDF generado.
+            pdf_path: Ruta al documento físico.
+            degrees: Grados de rotación en sentido horario (0, 90, 180, 270).
         """
+        if degrees == 0:
+            return
+            
+        temp_path = pdf_path.with_suffix('.tmp.pdf')
+        try:
+            with fitz.open(str(pdf_path)) as doc:
+                for page in doc:
+                    page.set_rotation((page.rotation + degrees) % 360)
+                doc.save(str(temp_path), incremental=False, encryption=fitz.PDF_ENCRYPT_NONE)
+                
+            temp_path.replace(pdf_path)
+            logger.debug(f"Mutación física aplicada: {pdf_path.name} rotado {degrees} grados.")
+        except Exception as e:
+            if temp_path.exists():
+                temp_path.unlink()
+            logger.error(f"Fallo crítico al aplicar rotación física en {pdf_path}: {e}", exc_info=True)
+            raise RuntimeError(f"Error de I/O al rotar PDF permanentemente: {e}") from e
+
+    @staticmethod
+    def wrap_image_to_pdf(image_path: Path, output_dir: Path) -> Path:
+        """Convierte una imagen a un documento PDF de una sola página."""
         base_name = image_path.stem.replace(" ", "_")
         new_name = f"{base_name}_P001_T001.pdf"
         output_path = output_dir / new_name
@@ -86,37 +96,30 @@ class PDFToolbox:
         return output_path
 
     @staticmethod
-    def merge_by_folio(pages_data: List[Dict[str, Any]], folio: str, output_dir: Path) -> Path:
-        """Une múltiples PDFs aplicando rotaciones específicas por página.
-
-        Garantiza que las páginas se compilen en el orden proveído y ajusta
-        la orientación espacial sumando los grados indicados a los metadatos
-        existentes del documento.
+    def merge_by_folio(pages_data: List[Dict[str, Any]], file_name: str, output_dir: Path) -> Path:
+        """Une múltiples PDFs secuencialmente utilizando el nombre exacto proporcionado.
+        
+        Acepta un diccionario con formato {'path': Path, 'rotation': int}. La rotación
+        generalmente será 0 si la mutación física ya fue aplicada previamente.
+        Permite sobrescribir el archivo destino si el orquestador determina deduplicación.
 
         Args:
-            pages_data: Diccionarios con formato {'path': Path, 'rotation': int}.
-            folio: Identificador lógico para nombrar el archivo final.
-            output_dir: Directorio de salida.
-
-        Returns:
-            Path: Ruta al archivo PDF consolidado.
+            pages_data: Lista de diccionarios con la ruta y rotación de cada página.
+            file_name: Nombre exacto del archivo final (e.g., 'FOLIO.pdf' o 'FOLIO_v2.pdf').
+            output_dir: Directorio de destino.
         """
-        safe_folio = "".join(c for c in folio if c.isalnum() or c in ('-', '_')).strip()
-        if not safe_folio:
-            safe_folio = "ERROR_FORMATO_INVALIDO"
-            
-        output_path = output_dir / f"{safe_folio}.pdf"
+        output_path = output_dir / file_name
         
-        counter = 1
-        while output_path.exists():
-            output_path = output_dir / f"{safe_folio}_V{counter}.pdf"
-            counter += 1
+        # Eliminamos el archivo previo si existe para habilitar la Sobrescritura (Deduplicación de mejor calidad)
+        if output_path.exists():
+            output_path.unlink()
+            logger.debug(f"Sobrescribiendo archivo existente para deduplicación: {file_name}")
         
         try:
             with fitz.open() as result_doc:
                 for page_info in pages_data:
                     path: Path = page_info["path"]
-                    rotation_to_apply: int = page_info.get("rotation", 0)
+                    rotation_to_apply: int = int(page_info.get("rotation", 0))
                     
                     with fitz.open(str(path)) as sub_doc:
                         if rotation_to_apply != 0:
@@ -129,7 +132,7 @@ class PDFToolbox:
                 
                 result_doc.save(str(output_path))
         except Exception as e:
-            logger.error(f"Error crítico al ensamblar folio {folio}: {e}", exc_info=True)
-            raise RuntimeError(f"Fallo en el ensamblaje final del documento {folio}") from e
+            logger.error(f"Error crítico al ensamblar documento {file_name}: {e}", exc_info=True)
+            raise RuntimeError(f"Fallo en el ensamblaje final del documento {file_name}") from e
             
         return output_path

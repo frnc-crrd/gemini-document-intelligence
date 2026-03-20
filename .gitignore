@@ -46,6 +46,7 @@ logs/
 
 # Contexto de proyecto y documentación interna (exclusión específica)
 contexto_proyecto.txt
+auditoria_cambios.txt
 
 # Binarios pesados y documentos (Case-insensitive para compatibilidad total)
 *.[pP][dD][fF]

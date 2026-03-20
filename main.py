@@ -1,32 +1,48 @@
-"""Punto de entrada principal para el Sistema de Gestión de Integridad Documental.
+"""Punto de entrada principal para el Sistema de Auditoría Documental CxC.
 
-Desencadena el flujo de procesamiento masivo coordinando el orquestador
-y la capa de presentación. Implementa un bloque `try/except` global para
-garantizar salidas limpias ante fallos no recuperables en el ciclo de vida.
+Orquesta la inicialización del esquema transaccional, desencadena el flujo de 
+procesamiento concurrente Map-Reduce, persiste los artefactos en PostgreSQL
+y genera el respaldo tabular en Excel.
 """
 
 import sys
 
 from src.core.processor import PipelineProcessor
 from src.utils.report_generator import ReportGenerator
+from src.db.repository import PostgresRepository
 from src.core.logger import get_system_logger
 
 logger = get_system_logger("main")
 
 
 def execute_audit_pipeline() -> None:
-    """Coordina la inicialización de dependencias y ejecución del orquestador."""
-    logger.info("SISTEMA DE GESTIÓN DE INTEGRIDAD DOCUMENTAL: Inicializando.")
+    """Coordina la ejecución end-to-end garantizando salidas limpias e Inyección de Dependencias."""
+    logger.info("SISTEMA DE AUDITORÍA DOCUMENTAL CXC: Inicializando.")
     
-    processor = PipelineProcessor()
+    try:
+        # 1. Validación de Infraestructura de Base de Datos
+        repo = PostgresRepository()
+        repo.initialize_schema()
+    except Exception as e:
+        logger.critical(f"Abortando ejecución. La base de datos no está disponible: {e}")
+        sys.exit(1)
+    
+    # 2. Ejecutar Arquitectura Map-Reduce (Inyectando el repositorio para reglas DDL)
+    processor = PipelineProcessor(db_repo=repo)
     resultados = processor.run()
     
     if resultados:
-        logger.info("Generando artefacto final de auditoría...")
+        # 3. Persistencia Transaccional (UPSERT para deduplicación)
+        logger.info("Iniciando UPSERT masivo de metadatos en PostgreSQL...")
+        repo.upsert_batch(resultados)
+        
+        # 4. Respaldo Tabular Físico
+        logger.info("Generando artefacto secundario de auditoría (Excel)...")
         ReportGenerator.generate_excel(resultados)
-        logger.info("Ejecución del pipeline finalizada con éxito.")
+        
+        logger.info("Ejecución del pipeline transaccional finalizada con éxito.")
     else:
-        logger.warning("El pipeline concluyó sin entidades lógicas válidas para reportar.")
+        logger.warning("El pipeline concluyó sin entidades lógicas válidas para procesar.")
 
 
 if __name__ == "__main__":
