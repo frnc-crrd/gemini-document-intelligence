@@ -2,10 +2,11 @@
 
 Implementa el pipeline Multi-Agente con heurísticas y mapeo visual estricto
 para evadir alucinaciones algorítmicas de la inferencia del modelo LLM.
+Garantiza la resiliencia de red mediante algoritmos de retroceso exponencial con Jitter.
 """
 
 import time
-import re
+import random
 from typing import List, Dict, Tuple, TypeVar, Type, Optional
 from pathlib import Path
 from PIL import Image
@@ -59,6 +60,7 @@ class DocumentAnalyzer:
         contents.append(prompt)
 
         base_wait = settings.api_delay
+        max_wait = 60.0
 
         for attempt in range(settings.max_retries):
             try:
@@ -75,14 +77,24 @@ class DocumentAnalyzer:
                 if response.parsed:
                     return response.parsed
             except APIError as e:
-                error_msg = str(e)
-                logger.warning(f"Error en API (Intento {attempt + 1}/{settings.max_retries}): {error_msg}")
-                wait_time = base_wait * (2 ** attempt)
-                if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                    match = re.search(r'retry in ([\d\.]+)s', error_msg)
-                    if match: wait_time = float(match.group(1)) + 2.0
-                time.sleep(wait_time)
-            except Exception:
+                error_msg = str(e).upper()
+                # Códigos de error transitorios que justifican un reintento (Rate Limits y Server Errors)
+                is_retryable = any(code in error_msg for code in ["429", "RESOURCE_EXHAUSTED", "500", "502", "503", "504"])
+                
+                if is_retryable:
+                    logger.warning(f"Inestabilidad de red o cuota excedida (Intento {attempt + 1}/{settings.max_retries}): {e}")
+                    if attempt < settings.max_retries - 1:
+                        # Implementación estricta de Exponential Backoff con Full Jitter
+                        temp_wait = min(max_wait, base_wait * (2 ** attempt))
+                        jitter_wait = random.uniform(0.0, temp_wait)
+                        time.sleep(jitter_wait)
+                    else:
+                        logger.error("Se agotaron los reintentos permitidos. Abortando inferencia para este lote.")
+                else:
+                    logger.error(f"Fallo irrecuperable en la API (Ej. Bad Request / Error de Sintaxis): {e}")
+                    break
+            except Exception as e:
+                logger.error(f"Fallo sistémico no controlado durante la inferencia: {e}", exc_info=True)
                 break
                 
         return None
@@ -102,13 +114,11 @@ class DocumentAnalyzer:
         prompt_espacial = f"""Eres un clasificador espacial de alta precisión.
 Tu tarea es determinar la rotación necesaria para que el documento sea legible (texto normal).
 Evalúa CADA IMAGEN de '{original_filename}'.
-
 HEURÍSTICA DE ROTACIÓN ESTRICTA (Grados a aplicar en SENTIDO HORARIO para arreglar la imagen):
 - 0: La imagen ya está perfecta. El texto se lee normal de izquierda a derecha.
 - 90: El texto está acostado. Las letras van de ABAJO hacia ARRIBA (Si lo ves de frente, tienes que torcer la cabeza a la izquierda para leer).
 - 180: El documento está totalmente DE CABEZA (texto invertido).
 - 270: El texto está acostado. Las letras van de ARRIBA hacia ABAJO (Tienes que torcer la cabeza a la derecha para leer).
-
 INSTRUCCIONES:
 1. Identifica hacia dónde "apunta" la parte superior del texto (anclas como RFC, tablas, logos).
 2. Responde ESTRICTAMENTE con: 0, 90, 180 o 270.

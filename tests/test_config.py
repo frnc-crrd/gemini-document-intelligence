@@ -1,7 +1,8 @@
 """Pruebas unitarias para el módulo de configuración del sistema.
 
 Valida la correcta carga de variables de entorno, la inicialización
-de rutas dinámicas y el comportamiento ante la ausencia de credenciales.
+de rutas dinámicas, el control de concurrencia y el comportamiento 
+ante la ausencia de credenciales.
 """
 
 import pytest
@@ -21,6 +22,8 @@ def test_settings_successful_initialization(monkeypatch: pytest.MonkeyPatch) -> 
     assert settings.execution_mode == "cloud"
     assert settings.dpi_conversion == 200
     assert settings.max_retries == 3
+    assert settings.max_threads == 16
+    assert settings.vision_batch_size == 15
 
 
 def test_settings_missing_api_key_raises_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -58,3 +61,13 @@ def test_settings_validation_constraints(monkeypatch: pytest.MonkeyPatch) -> Non
         get_settings()
         
     assert "dpi_conversion" in str(exc_info.value)
+
+def test_settings_concurrency_constraints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifica las restricciones para la inyección de parámetros de concurrencia."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test_api_key_123")
+    monkeypatch.setenv("MAX_THREADS", "0") # Viola ge=1
+    
+    with pytest.raises(ValidationError) as exc_info:
+        get_settings()
+        
+    assert "max_threads" in str(exc_info.value)

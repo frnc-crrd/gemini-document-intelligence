@@ -33,10 +33,12 @@ class Settings(BaseSettings):
     execution_mode: str = Field(default="local", description="Define el comportamiento del almacenamiento (local/cloud).")
     aws_bucket_name: str = Field(default="tu-bucket-produccion", description="Bucket S3 destino cuando execution_mode='cloud'.")
 
-    # Parámetros de Procesamiento
+    # Parámetros de Procesamiento y Concurrencia
     dpi_conversion: int = Field(default=200, ge=72, le=600, description="Resolución de rasterización (DPI).")
     max_retries: int = Field(default=3, ge=1, description="Límite máximo de reintentos para peticiones externas.")
     api_delay: float = Field(default=0.5, ge=0.1, description="Segundos base para pausas entre peticiones.")
+    max_threads: int = Field(default=16, ge=1, description="Número de hilos concurrentes para procesamiento I/O Bound.")
+    vision_batch_size: int = Field(default=15, ge=1, description="Cantidad máxima de imágenes a enviar por petición a la API.")
 
     # Constantes de Estado
     error_no_detectado: str = Field(default="ERROR_SIN_FOLIO")

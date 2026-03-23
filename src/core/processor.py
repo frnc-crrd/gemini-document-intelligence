@@ -1,34 +1,44 @@
 """Orquestador principal del pipeline de integridad documental.
 
 Coordina la ingesta, explosión, análisis contextual paralelo y ensamblaje final.
-Implementa procesamiento multihilo y sincronización con el repositorio de base 
-de datos para blindar el flujo de I/O de archivos.
+Implementa procesamiento multihilo, balanceo de carga para imágenes fotográficas
+sueltas y sincronización con el repositorio de base de datos para blindar 
+el flujo de I/O de archivos.
 """
 
 import re
 import uuid
 from pathlib import Path
-from typing import List, Dict, Any, Set, Optional
+from typing import List, Dict, Any, Set, Optional, Protocol
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import fitz
 
 from src.config import get_settings
 from src.core.logger import get_system_logger
-from src.core.analyzer import DocumentAnalyzer
 from src.utils.pdf_tools import PDFToolbox
 from src.db.repository import PostgresRepository
+from src.models import AnalysisResponse
 
 logger = get_system_logger(__name__)
 settings = get_settings()
 
 
+class IDocumentAnalyzer(Protocol):
+    """Contrato estricto (Interfaz) para cualquier motor de inferencia analítica."""
+    def analyze_batch(self, page_paths: List[Path], original_filename: str) -> AnalysisResponse:
+        ...
+
+
 class PipelineProcessor:
     """Controlador central del flujo de trabajo documental."""
 
-    def __init__(self, db_repo: Optional[PostgresRepository] = None) -> None:
+    # Modificación: Inyección de Dependencias en el constructor
+    def __init__(self, analyzer: IDocumentAnalyzer, db_repo: Optional[PostgresRepository] = None) -> None:
         self._ensure_directories()
-        self.analyzer = DocumentAnalyzer()
+        self.analyzer = analyzer
         self.db_repo = db_repo or PostgresRepository()
-        self.max_workers = 4
+        self.max_workers = settings.max_threads
 
     def _ensure_directories(self) -> None:
         for directory in [settings.raw_dir, settings.explosion_dir, settings.final_dir]:
@@ -37,6 +47,17 @@ class PipelineProcessor:
     def _sanitize_folder_name(self, name: str) -> str:
         s = re.sub(r'[^\w\s-]', '', name).strip()
         return re.sub(r'[\s]+', '_', s)
+
+    def _get_safe_category_dir(self, category_name: str) -> Path:
+        """Resuelve y valida la ruta de destino mitigando vulnerabilidades de Path Traversal."""
+        category_folder = self._sanitize_folder_name(category_name)
+        category_dir = (settings.final_dir / category_folder).resolve()
+        
+        if not category_dir.is_relative_to(settings.final_dir.resolve()):
+            logger.critical(f"Intento de Path Traversal detectado y bloqueado para categoría: {category_name}")
+            raise ValueError(f"Ruta de destino inválida o maliciosa: {category_dir}")
+            
+        return category_dir
 
     def run(self) -> List[Dict[str, Any]]:
         raw_files = [f for f in settings.raw_dir.iterdir() if f.is_file()]
@@ -80,20 +101,48 @@ class PipelineProcessor:
             if not exploded_paths: 
                 return []
             return self._execute_ai_pipeline(exploded_paths, file_path.name, "PDF")
-        except Exception:
+        except fitz.FileDataError as e:
+            logger.error(f"Estructura de PDF corrupta o ilegible al procesar {file_path.name}: {e}")
+            return []
+        except OSError as e:
+            logger.error(f"Error de sistema operativo (I/O) al acceder a {file_path.name}: {e}")
             return []
 
     def _process_loose_images(self, image_paths: List[Path]) -> List[Dict[str, Any]]:
-        logger.info(f"Procesando lote de {len(image_paths)} imágenes sueltas.")
-        exploded_paths: List[Path] = []
-        for p in image_paths:
-            try:
-                exploded_paths.append(PDFToolbox.wrap_image_to_pdf(p, settings.explosion_dir))
-            except Exception:
-                pass
-        if not exploded_paths: 
-            return []
-        return self._execute_ai_pipeline(exploded_paths, "LOTE_FOTOGRAFICO_SUELTO", "IMÁGENES MIXTAS")
+        """Aplica segmentación y encolamiento (Lazy Load) para procesamiento masivo de imágenes fotográficas."""
+        logger.info(f"Iniciando procesamiento de {len(image_paths)} imágenes sueltas. Aplicando segmentación.")
+        
+        try:
+            sorted_images = sorted(image_paths, key=lambda p: (p.stat().st_mtime, p.name))
+        except OSError as e:
+            logger.warning(f"Imposible acceder a metadatos de sistema, ordenando alfabéticamente: {e}")
+            sorted_images = sorted(image_paths, key=lambda p: p.name)
+
+        batch_size = settings.vision_batch_size
+        batches = [sorted_images[i:i + batch_size] for i in range(0, len(sorted_images), batch_size)]
+        
+        all_results: List[Dict[str, Any]] = []
+
+        for batch_index, current_batch in enumerate(batches, 1):
+            logger.info(f"Procesando fragmento fotográfico {batch_index}/{len(batches)} (Tamaño: {len(current_batch)} imágenes).")
+            exploded_paths: List[Path] = []
+            
+            for img_path in current_batch:
+                try:
+                    exploded_paths.append(PDFToolbox.wrap_image_to_pdf(img_path, settings.explosion_dir))
+                except OSError as e:
+                    logger.error(f"Fallo de lectura de imagen {img_path.name}: {e}")
+                except Exception as e:
+                    logger.error(f"Error de conversión para imagen {img_path.name}: {e}", exc_info=True)
+
+            if not exploded_paths:
+                continue
+
+            batch_id = f"LOTE_FOTOGRAFICO_G{batch_index:03d}"
+            batch_results = self._execute_ai_pipeline(exploded_paths, batch_id, "IMÁGENES MIXTAS")
+            all_results.extend(batch_results)
+
+        return all_results
 
     def _execute_ai_pipeline(self, exploded_paths: List[Path], original_file_name: str, original_file_type: str) -> List[Dict[str, Any]]:
         batch_results: List[Dict[str, Any]] = []
@@ -119,11 +168,16 @@ class PipelineProcessor:
                 continue
 
             final_page_count = len(pages_data)
-            category_folder = self._sanitize_folder_name(doc.document_type)
-            category_dir = settings.final_dir / category_folder
-            category_dir.mkdir(exist_ok=True, parents=True)
+            
+            try:
+                category_dir = self._get_safe_category_dir(doc.document_type)
+                category_dir.mkdir(exist_ok=True, parents=True)
+            except ValueError as e:
+                logger.error(f"Abortando ensamblaje por violación de seguridad: {e}")
+                continue
 
             status = "OK" if doc.confidence_score > 80 else "REVISIÓN MANUAL"
+            category_folder = category_dir.name
             
             for folio in doc.folios:
                 ruta_segura_fallback = f"ERROR_ENSAMBLAJE/{folio}_{uuid.uuid4().hex[:8]}.pdf"
@@ -132,7 +186,9 @@ class PipelineProcessor:
                     if not safe_folio:
                         safe_folio = "ERROR_FORMATO_INVALIDO"
 
-                    version, accion = self.db_repo.resolve_versioning(safe_folio, original_file_name, doc.confidence_score)
+                    version, accion = self.db_repo.resolve_versioning(
+                        safe_folio, doc.document_type, original_file_name, doc.confidence_score
+                    )
                     
                     if accion == "DESCARTAR":
                         continue
@@ -172,9 +228,12 @@ class PipelineProcessor:
 
         orphan_files = set(path_map.keys()) - used_pages
         if orphan_files:
-            category_folder = "Huerfanos_Rebotes"
-            category_dir = settings.final_dir / category_folder
-            category_dir.mkdir(exist_ok=True, parents=True)
+            try:
+                category_dir = self._get_safe_category_dir("Huerfanos_Rebotes")
+                category_dir.mkdir(exist_ok=True, parents=True)
+                category_folder = category_dir.name
+            except ValueError:
+                return batch_results
             
             for orphan in orphan_files:
                 ruta_segura_huerfano = f"ERROR_ENSAMBLAJE/HUERFANO_{uuid.uuid4().hex[:8]}.pdf"

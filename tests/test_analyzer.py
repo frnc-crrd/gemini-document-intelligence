@@ -1,6 +1,7 @@
 """Pruebas unitarias para el motor de análisis y comunicación de LLM.
 
-Utiliza simulaciones estandarizadas para aislar la lógica de red externa.
+Aísla la lógica de red externa y asegura que el algoritmo de retroceso 
+exponencial con Jitter no rompa las aserciones estáticas de reintento.
 """
 
 import pytest
@@ -20,7 +21,7 @@ def analyzer() -> Generator[DocumentAnalyzer, None, None]:
          
         mock_settings.gemini_api_key = "fake_key_123"
         mock_settings.max_retries = 2
-        mock_settings.api_delay = 0.01
+        mock_settings.api_delay = 0.01  # Minimiza el retardo en las pruebas de Jitter
         mock_settings.gemini_model = "test-model"
         
         yield DocumentAnalyzer()
@@ -48,8 +49,8 @@ def test_ejecutar_agente_success(analyzer: DocumentAnalyzer) -> None:
     assert result.documents[0].page_roles[0].role == "UNICA"
 
 
-def test_ejecutar_agente_retries_and_fails(analyzer: DocumentAnalyzer) -> None:
-    """Verifica que el límite de reintentos aborte devolviendo None en fallos persistentes."""
+def test_ejecutar_agente_retries_and_fails_on_exhaustion(analyzer: DocumentAnalyzer) -> None:
+    """Verifica que el límite de reintentos aborte devolviendo None ante errores transitorios persistentes (429)."""
     analyzer.client.models.generate_content.side_effect = APIError(
         "429 Resource has been exhausted (e.g. check quota).",
         {}
@@ -58,7 +59,22 @@ def test_ejecutar_agente_retries_and_fails(analyzer: DocumentAnalyzer) -> None:
     result = analyzer._ejecutar_agente("test prompt", [("name", MagicMock())], ExtractionResponse)
     
     assert result is None
+    # Con max_retries=2, debe intentar y fallar dos veces
     assert analyzer.client.models.generate_content.call_count == 2
+
+
+def test_ejecutar_agente_aborts_immediately_on_fatal_error(analyzer: DocumentAnalyzer) -> None:
+    """Asegura que los errores 400 Bad Request no activen la lógica de reintento Jitter."""
+    analyzer.client.models.generate_content.side_effect = APIError(
+        "400 Bad Request: Invalid payload structure.",
+        {}
+    )
+
+    result = analyzer._ejecutar_agente("test prompt", [("name", MagicMock())], ExtractionResponse)
+    
+    assert result is None
+    # Al no ser un error transitorio, debe fallar en el primer intento sin iterar
+    assert analyzer.client.models.generate_content.call_count == 1
 
 
 @patch("src.utils.pdf_tools.PDFToolbox.apply_physical_rotation")

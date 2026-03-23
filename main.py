@@ -8,6 +8,7 @@ y genera el respaldo tabular en Excel.
 import sys
 
 from src.core.processor import PipelineProcessor
+from src.core.analyzer import DocumentAnalyzer
 from src.utils.report_generator import ReportGenerator
 from src.db.repository import PostgresRepository
 from src.core.logger import get_system_logger
@@ -27,16 +28,19 @@ def execute_audit_pipeline() -> None:
         logger.critical(f"Abortando ejecución. La base de datos no está disponible: {e}")
         sys.exit(1)
     
-    # 2. Ejecutar Arquitectura Map-Reduce (Inyectando el repositorio para reglas DDL)
-    processor = PipelineProcessor(db_repo=repo)
+    # 2. Composición de Raíz (Composition Root): Inyección de dependencias
+    analyzer = DocumentAnalyzer()
+    processor = PipelineProcessor(analyzer=analyzer, db_repo=repo)
+    
+    # 3. Ejecutar Arquitectura Map-Reduce 
     resultados = processor.run()
     
     if resultados:
-        # 3. Persistencia Transaccional (UPSERT para deduplicación)
+        # 4. Persistencia Transaccional (UPSERT para deduplicación)
         logger.info("Iniciando UPSERT masivo de metadatos en PostgreSQL...")
         repo.upsert_batch(resultados)
         
-        # 4. Respaldo Tabular Físico
+        # 5. Respaldo Tabular Físico
         logger.info("Generando artefacto secundario de auditoría (Excel)...")
         ReportGenerator.generate_excel(resultados)
         

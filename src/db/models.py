@@ -20,6 +20,7 @@ class RegistroArtefacto(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     folio = Column(String(100), nullable=False, index=True)
+    categoria = Column(String(100), nullable=False, index=True, default='No identificado')
     version = Column(Integer, default=1, nullable=False)
     divisa = Column(String(20), default='NO_DETECTADA')
     cliente = Column(String(255), default='NO DETECTADO', index=True)
@@ -36,5 +37,5 @@ class RegistroArtefacto(Base):
     fecha_procesamiento = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
-        UniqueConstraint('folio', 'version', 'archivo_original', name='uix_folio_version_origen'),
+        UniqueConstraint('folio', 'categoria', 'version', 'archivo_original', name='uix_folio_categoria_version_origen'),
     )

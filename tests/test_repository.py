@@ -1,7 +1,8 @@
 """Pruebas unitarias para la capa de persistencia (Patrón Repositorio).
 
 Valida el motor de reglas de deduplicación y versionamiento, el manejo 
-de transacciones UPSERT y la purga pre-transaccional de colisiones.
+de transacciones UPSERT y la purga pre-transaccional de colisiones considerando
+la nueva heurística de aislamiento por categoría documental.
 """
 
 import pytest
@@ -28,7 +29,7 @@ def test_resolve_versioning_nuevo(repo: PostgresRepository) -> None:
     repo.SessionLocal.return_value.__enter__.return_value = mock_session
     mock_session.query().filter_by().all.return_value = []
     
-    version, action = repo.resolve_versioning("F-123", "origen.pdf", 90)
+    version, action = repo.resolve_versioning("F-123", "Factura", "origen.pdf", 90)
     assert version == 1
     assert action == "NUEVO"
 
@@ -43,7 +44,7 @@ def test_resolve_versioning_mismo_origen_sobrescribir(repo: PostgresRepository) 
     mock_registro.confianza_promedio = 80
     mock_session.query().filter_by().all.return_value = [mock_registro]
     
-    version, action = repo.resolve_versioning("F-123", "origen.pdf", 90)
+    version, action = repo.resolve_versioning("F-123", "Remisión", "origen.pdf", 90)
     assert version == 1
     assert action == "SOBRESCRIBIR"
 
@@ -58,7 +59,7 @@ def test_resolve_versioning_mismo_origen_descartar(repo: PostgresRepository) -> 
     mock_registro.confianza_promedio = 95
     mock_session.query().filter_by().all.return_value = [mock_registro]
     
-    version, action = repo.resolve_versioning("F-123", "origen.pdf", 80)
+    version, action = repo.resolve_versioning("F-123", "Factura", "origen.pdf", 80)
     assert version == 1
     assert action == "DESCARTAR"
 
@@ -72,8 +73,22 @@ def test_resolve_versioning_diferente_origen_versionar(repo: PostgresRepository)
     mock_registro.version = 2
     mock_session.query().filter_by().all.return_value = [mock_registro]
     
-    version, action = repo.resolve_versioning("F-123", "nuevo_origen.pdf", 90)
+    version, action = repo.resolve_versioning("F-123", "Remisión", "nuevo_origen.pdf", 90)
     assert version == 3
+    assert action == "NUEVO"
+
+
+def test_resolve_versioning_diferente_categoria_no_colisiona(repo: PostgresRepository) -> None:
+    """Valida que documentos con el mismo folio y origen pero distinta categoría no escalen versión."""
+    mock_session = MagicMock()
+    repo.SessionLocal.return_value.__enter__.return_value = mock_session
+    
+    # La consulta a BD simula no encontrar registros para esta categoría específica
+    mock_session.query().filter_by().all.return_value = []
+    
+    version, action = repo.resolve_versioning("F-123", "Factura", "nuevo_origen.pdf", 90)
+    
+    assert version == 1
     assert action == "NUEVO"
 
 
@@ -83,7 +98,7 @@ def test_upsert_batch_success(repo: PostgresRepository) -> None:
     mock_session.query().filter_by().first.return_value = None
 
     test_data = [{
-        "Folio": "F-TEST-1", "Versión": 1, "Divisa": "MXN",
+        "Folio": "F-TEST-1", "Categoría": "Factura", "Versión": 1, "Divisa": "MXN",
         "Archivo Original": "test.pdf", "Status": "OK",
         "Ruta del Archivo": "/ruta/test.pdf"
     }]
@@ -101,8 +116,8 @@ def test_upsert_batch_internal_deduplication(repo: PostgresRepository) -> None:
     mock_session.query().filter_by().first.return_value = None
 
     test_data = [
-        {"Folio": "DUP-1", "Versión": 1, "Archivo Original": "origen.pdf", "Confianza": 80},
-        {"Folio": "DUP-1", "Versión": 1, "Archivo Original": "origen.pdf", "Confianza": 95}, # Sobrescribe al anterior en memoria
+        {"Folio": "DUP-1", "Categoría": "Factura", "Versión": 1, "Archivo Original": "origen.pdf", "Confianza": 80},
+        {"Folio": "DUP-1", "Categoría": "Factura", "Versión": 1, "Archivo Original": "origen.pdf", "Confianza": 95},
     ]
 
     repo.upsert_batch(test_data)
@@ -119,7 +134,7 @@ def test_upsert_batch_update_existing(repo: PostgresRepository) -> None:
     mock_existente = MagicMock()
     mock_session.query().filter_by().first.return_value = mock_existente
 
-    test_data = [{"Folio": "F-TEST-1", "Versión": 1, "Ruta del Archivo": "/nueva/ruta.pdf"}]
+    test_data = [{"Folio": "F-TEST-1", "Categoría": "Remisión", "Versión": 1, "Ruta del Archivo": "/nueva/ruta.pdf"}]
     
     repo.upsert_batch(test_data)
     
@@ -143,7 +158,7 @@ def test_upsert_batch_rollback_on_error(repo: PostgresRepository) -> None:
     repo.SessionLocal.return_value.__enter__.return_value = mock_session
     mock_session.query.side_effect = SQLAlchemyError("Simulated DB Lock Error")
 
-    test_data = [{"Folio": "F-TEST-2", "Ruta del Archivo": "/ruta/test2.pdf"}]
+    test_data = [{"Folio": "F-TEST-2", "Categoría": "Factura", "Ruta del Archivo": "/ruta/test2.pdf"}]
 
     repo.upsert_batch(test_data)
 

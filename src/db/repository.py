@@ -33,7 +33,8 @@ class PostgresRepository:
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         
         self._cache_lock = threading.Lock()
-        self._version_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # Modificación: La llave del caché ahora es compuesta (folio, categoria)
+        self._version_cache: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
 
     def initialize_schema(self) -> None:
         """Construye el esquema DDL en el motor PostgreSQL si no existe."""
@@ -44,25 +45,33 @@ class PostgresRepository:
             logger.critical(f"Fallo al inicializar el esquema de base de datos: {e}", exc_info=True)
             raise
 
-    def resolve_versioning(self, folio: str, archivo_original: str, confianza: int) -> Tuple[int, str]:
+    def resolve_versioning(self, folio: str, categoria: str, archivo_original: str, confianza: int) -> Tuple[int, str]:
         """Aplica la regla de deduplicación vs versionamiento de manera Thread-Safe.
-        
+
+        Args:
+            folio: Identificador extraído del documento.
+            categoria: Tipo lógico del documento detectado.
+            archivo_original: Nombre del archivo de origen.
+            confianza: Nivel de certeza de la extracción.
+
         Returns:
             Tuple[int, str]: (Versión a asignar, Acción a tomar ['NUEVO', 'SOBRESCRIBIR', 'DESCARTAR']).
         """
+        cache_key = (folio, categoria)
+        
         with self._cache_lock:
-            if folio not in self._version_cache:
+            if cache_key not in self._version_cache:
                 with self.SessionLocal() as session:
-                    registros = session.query(RegistroArtefacto).filter_by(folio=folio).all()
-                    self._version_cache[folio] = [
+                    registros = session.query(RegistroArtefacto).filter_by(folio=folio, categoria=categoria).all()
+                    self._version_cache[cache_key] = [
                         {"origen": r.archivo_original, "version": r.version, "score": r.confianza_promedio}
                         for r in registros
                     ]
             
-            registros_mem = self._version_cache[folio]
+            registros_mem = self._version_cache[cache_key]
             
             if not registros_mem:
-                self._version_cache[folio].append({"origen": archivo_original, "version": 1, "score": confianza})
+                self._version_cache[cache_key].append({"origen": archivo_original, "version": 1, "score": confianza})
                 return 1, "NUEVO"
             
             for reg in registros_mem:
@@ -75,7 +84,7 @@ class PostgresRepository:
                         
             max_version = max(r["version"] for r in registros_mem)
             new_version = max_version + 1
-            self._version_cache[folio].append({"origen": archivo_original, "version": new_version, "score": confianza})
+            self._version_cache[cache_key].append({"origen": archivo_original, "version": new_version, "score": confianza})
             return new_version, "NUEVO"
 
     def upsert_batch(self, batch_data: List[Dict[str, Any]]) -> None:
@@ -86,25 +95,26 @@ class PostgresRepository:
         # Deduplicación Pre-Transaccional: Evita colisiones de estado no sincronizado (unflushed)
         deduplicated_batch = {}
         for item in batch_data:
-            key = (item.get("Folio"), item.get("Versión", 1), item.get("Archivo Original"))
+            key = (item.get("Folio"), item.get("Categoría", "No identificado"), item.get("Versión", 1), item.get("Archivo Original"))
             deduplicated_batch[key] = item
 
         with self.SessionLocal() as session:
             try:
                 for item in deduplicated_batch.values():
                     folio = item.get("Folio", "ERROR_SIN_FOLIO")
+                    categoria = item.get("Categoría", "No identificado")
                     version = item.get("Versión", 1)
                     archivo_original = item.get("Archivo Original", "DESCONOCIDO")
                     ruta_asignada = item.get("Ruta del Archivo", "")
                     
                     existente = session.query(RegistroArtefacto).filter_by(
-                        folio=folio, version=version, archivo_original=archivo_original
+                        folio=folio, categoria=categoria, version=version, archivo_original=archivo_original
                     ).first()
                     
                     if existente:
                         existente.divisa = item.get("Divisa", existente.divisa)
                         existente.cliente = item.get("Cliente", existente.cliente)
-                        existente.paginas_consolidado = item.get("Páginas Consolidado", existente.paginas_consolidado)
+                        existente.paginas_consolidado = item.get("Páginas Final", existente.paginas_consolidado)
                         existente.status = item.get("Status", existente.status)
                         existente.confianza_promedio = item.get("Confianza", existente.confianza_promedio)
                         existente.ruta_servidor = ruta_asignada
@@ -112,6 +122,7 @@ class PostgresRepository:
                     else:
                         record = RegistroArtefacto(
                             folio=folio,
+                            categoria=categoria,
                             version=version,
                             divisa=item.get("Divisa", "NO_DETECTADA"),
                             cliente=item.get("Cliente", "NO DETECTADO"),
