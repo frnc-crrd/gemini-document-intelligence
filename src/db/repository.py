@@ -3,7 +3,8 @@
 Maneja el pool de conexiones y las transacciones masivas (Bulk Inserts),
 garantizando ACID (Atomicidad, Consistencia, Aislamiento y Durabilidad).
 Implementa un coordinador de estado en memoria (Thread-Safe Cache) para 
-resolver colisiones de versionamiento y deduplicación pre-transaccional.
+resolver colisiones de versionamiento y delegación vectorizada a PostgreSQL
+para deduplicación pre-transaccional.
 """
 
 import threading
@@ -11,6 +12,7 @@ from typing import List, Dict, Any, Tuple
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.dialects.postgresql import insert
 
 from src.config import get_settings
 from src.core.logger import get_system_logger
@@ -33,7 +35,6 @@ class PostgresRepository:
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         
         self._cache_lock = threading.Lock()
-        # Modificación: La llave del caché ahora es compuesta (folio, categoria)
         self._version_cache: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
 
     def initialize_schema(self) -> None:
@@ -88,55 +89,53 @@ class PostgresRepository:
             return new_version, "NUEVO"
 
     def upsert_batch(self, batch_data: List[Dict[str, Any]]) -> None:
-        """Inserta nuevos registros o actualiza los existentes con deduplicación In-Memory."""
+        """Delega la inserción masiva y resolución de conflictos al motor de PostgreSQL de forma vectorizada."""
         if not batch_data:
             return
 
-        # Deduplicación Pre-Transaccional: Evita colisiones de estado no sincronizado (unflushed)
         deduplicated_batch = {}
         for item in batch_data:
             key = (item.get("Folio"), item.get("Categoría", "No identificado"), item.get("Versión", 1), item.get("Archivo Original"))
             deduplicated_batch[key] = item
 
+        values_to_insert = []
+        for item in deduplicated_batch.values():
+            values_to_insert.append({
+                "folio": item.get("Folio", "ERROR_SIN_FOLIO"),
+                "categoria": item.get("Categoría", "No identificado"),
+                "version": item.get("Versión", 1),
+                "archivo_original": item.get("Archivo Original", "DESCONOCIDO"),
+                "divisa": item.get("Divisa", "NO_DETECTADA"),
+                "cliente": item.get("Cliente", "NO DETECTADO"),
+                "paginas_consolidado": item.get("Páginas Final", 1),
+                "status": item.get("Status", "PENDIENTE"),
+                "confianza_promedio": item.get("Confianza", 0),
+                "ruta_servidor": item.get("Ruta del Archivo", ""),
+                "justificacion": item.get("Justificación", "")
+            })
+
         with self.SessionLocal() as session:
             try:
-                for item in deduplicated_batch.values():
-                    folio = item.get("Folio", "ERROR_SIN_FOLIO")
-                    categoria = item.get("Categoría", "No identificado")
-                    version = item.get("Versión", 1)
-                    archivo_original = item.get("Archivo Original", "DESCONOCIDO")
-                    ruta_asignada = item.get("Ruta del Archivo", "")
-                    
-                    existente = session.query(RegistroArtefacto).filter_by(
-                        folio=folio, categoria=categoria, version=version, archivo_original=archivo_original
-                    ).first()
-                    
-                    if existente:
-                        existente.divisa = item.get("Divisa", existente.divisa)
-                        existente.cliente = item.get("Cliente", existente.cliente)
-                        existente.paginas_consolidado = item.get("Páginas Final", existente.paginas_consolidado)
-                        existente.status = item.get("Status", existente.status)
-                        existente.confianza_promedio = item.get("Confianza", existente.confianza_promedio)
-                        existente.ruta_servidor = ruta_asignada
-                        existente.justificacion = item.get("Justificación", existente.justificacion)
-                    else:
-                        record = RegistroArtefacto(
-                            folio=folio,
-                            categoria=categoria,
-                            version=version,
-                            divisa=item.get("Divisa", "NO_DETECTADA"),
-                            cliente=item.get("Cliente", "NO DETECTADO"),
-                            archivo_original=archivo_original,
-                            paginas_consolidado=item.get("Páginas Final", 1),
-                            status=item.get("Status", "PENDIENTE"),
-                            confianza_promedio=item.get("Confianza", 0),
-                            ruta_servidor=ruta_asignada,
-                            justificacion=item.get("Justificación", "")
-                        )
-                        session.add(record)
-                        
+                stmt = insert(RegistroArtefacto).values(values_to_insert)
+                
+                update_dict = {
+                    "divisa": stmt.excluded.divisa,
+                    "cliente": stmt.excluded.cliente,
+                    "paginas_consolidado": stmt.excluded.paginas_consolidado,
+                    "status": stmt.excluded.status,
+                    "confianza_promedio": stmt.excluded.confianza_promedio,
+                    "ruta_servidor": stmt.excluded.ruta_servidor,
+                    "justificacion": stmt.excluded.justificacion
+                }
+                
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['folio', 'categoria', 'version', 'archivo_original'],
+                    set_=update_dict
+                )
+                
+                session.execute(stmt)
                 session.commit()
-                logger.info(f"Transacción exitosa: Lote de {len(deduplicated_batch)} artefactos UPSERT en PostgreSQL.")
+                logger.info(f"Transacción exitosa: Lote de {len(values_to_insert)} artefactos UPSERT vectorizado en PostgreSQL.")
             except SQLAlchemyError as e:
                 session.rollback()
-                logger.error(f"Fallo de integridad transaccional al insertar el lote. Rollback ejecutado: {e}", exc_info=True)
+                logger.error(f"Fallo de integridad transaccional al insertar el lote vectorizado. Rollback ejecutado: {e}", exc_info=True)

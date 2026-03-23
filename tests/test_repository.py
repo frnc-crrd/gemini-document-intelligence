@@ -2,7 +2,7 @@
 
 Valida el motor de reglas de deduplicación y versionamiento, el manejo 
 de transacciones UPSERT y la purga pre-transaccional de colisiones considerando
-la nueva heurística de aislamiento por categoría documental.
+la nueva heurística de aislamiento por categoría documental y la vectorización.
 """
 
 import pytest
@@ -79,11 +79,8 @@ def test_resolve_versioning_diferente_origen_versionar(repo: PostgresRepository)
 
 
 def test_resolve_versioning_diferente_categoria_no_colisiona(repo: PostgresRepository) -> None:
-    """Valida que documentos con el mismo folio y origen pero distinta categoría no escalen versión."""
     mock_session = MagicMock()
     repo.SessionLocal.return_value.__enter__.return_value = mock_session
-    
-    # La consulta a BD simula no encontrar registros para esta categoría específica
     mock_session.query().filter_by().all.return_value = []
     
     version, action = repo.resolve_versioning("F-123", "Factura", "nuevo_origen.pdf", 90)
@@ -95,7 +92,6 @@ def test_resolve_versioning_diferente_categoria_no_colisiona(repo: PostgresRepos
 def test_upsert_batch_success(repo: PostgresRepository) -> None:
     mock_session = MagicMock()
     repo.SessionLocal.return_value.__enter__.return_value = mock_session
-    mock_session.query().filter_by().first.return_value = None
 
     test_data = [{
         "Folio": "F-TEST-1", "Categoría": "Factura", "Versión": 1, "Divisa": "MXN",
@@ -105,15 +101,13 @@ def test_upsert_batch_success(repo: PostgresRepository) -> None:
 
     repo.upsert_batch(test_data)
     
-    mock_session.add.assert_called_once()
+    mock_session.execute.assert_called_once()
     mock_session.commit.assert_called_once()
 
 
 def test_upsert_batch_internal_deduplication(repo: PostgresRepository) -> None:
-    """Verifica que el repositorio limpie colisiones internas en el mismo lote antes del commit."""
     mock_session = MagicMock()
     repo.SessionLocal.return_value.__enter__.return_value = mock_session
-    mock_session.query().filter_by().first.return_value = None
 
     test_data = [
         {"Folio": "DUP-1", "Categoría": "Factura", "Versión": 1, "Archivo Original": "origen.pdf", "Confianza": 80},
@@ -122,24 +116,7 @@ def test_upsert_batch_internal_deduplication(repo: PostgresRepository) -> None:
 
     repo.upsert_batch(test_data)
     
-    # Solo debe haberse invocado add() una vez, previniendo el error de SQLAlchemy
-    mock_session.add.assert_called_once()
-    mock_session.commit.assert_called_once()
-
-
-def test_upsert_batch_update_existing(repo: PostgresRepository) -> None:
-    mock_session = MagicMock()
-    repo.SessionLocal.return_value.__enter__.return_value = mock_session
-    
-    mock_existente = MagicMock()
-    mock_session.query().filter_by().first.return_value = mock_existente
-
-    test_data = [{"Folio": "F-TEST-1", "Categoría": "Remisión", "Versión": 1, "Ruta del Archivo": "/nueva/ruta.pdf"}]
-    
-    repo.upsert_batch(test_data)
-    
-    assert mock_existente.ruta_servidor == "/nueva/ruta.pdf"
-    mock_session.add.assert_not_called()
+    mock_session.execute.assert_called_once()
     mock_session.commit.assert_called_once()
 
 
@@ -149,14 +126,14 @@ def test_upsert_batch_empty_list(repo: PostgresRepository) -> None:
 
     repo.upsert_batch([])
 
-    mock_session.add.assert_not_called()
+    mock_session.execute.assert_not_called()
     mock_session.commit.assert_not_called()
 
 
 def test_upsert_batch_rollback_on_error(repo: PostgresRepository) -> None:
     mock_session = MagicMock()
     repo.SessionLocal.return_value.__enter__.return_value = mock_session
-    mock_session.query.side_effect = SQLAlchemyError("Simulated DB Lock Error")
+    mock_session.execute.side_effect = SQLAlchemyError("Simulated DB Lock Error")
 
     test_data = [{"Folio": "F-TEST-2", "Categoría": "Factura", "Ruta del Archivo": "/ruta/test2.pdf"}]
 

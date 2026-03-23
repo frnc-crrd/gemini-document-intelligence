@@ -1,8 +1,8 @@
 """Pruebas unitarias para el orquestador del pipeline documental.
 
 Aísla la lógica de concurrencia (ThreadPoolExecutor) y las operaciones de
-entrada/salida (I/O) utilizando Mocks. Implementa pruebas para la Inyección 
-de Dependencias sin requerir parches globales (Monkeypatching) sobre clases concretas.
+entrada/salida (I/O) utilizando Mocks. Implementa pruebas formales para 
+validar la arquitectura Map-Reduce en el ensamblaje de lotes fragmentados.
 """
 
 import pytest
@@ -53,14 +53,14 @@ def processor(mock_settings: MagicMock, mock_repo: MagicMock, mock_analyzer: Mag
 
 
 def test_pipeline_empty_directory(processor: PipelineProcessor, mock_settings: MagicMock) -> None:
-    """Verifica que el orquestador aborte limpiamente si no hay carga de trabajo en el directorio raw."""
+    """Verifica que el orquestador aborte limpiamente si no hay carga de trabajo."""
     results = processor.run()
     assert len(results) == 0
 
 
 @patch("src.core.processor.PDFToolbox")
 def test_pipeline_processes_and_replicates_pdf(mock_toolbox: MagicMock, processor: PipelineProcessor, mock_settings: MagicMock) -> None:
-    """Valida el flujo de procesamiento primario, propagación de categoría y la inyección correcta de la versión."""
+    """Valida el flujo de procesamiento primario y la inyección correcta de la versión."""
     dummy_pdf = mock_settings.raw_dir / "factura_multiple.pdf"
     dummy_pdf.touch()
 
@@ -93,7 +93,7 @@ def test_pipeline_processes_and_replicates_pdf(mock_toolbox: MagicMock, processo
 
 @patch("src.core.processor.PDFToolbox")
 def test_pipeline_orphan_catcher_logic(mock_toolbox: MagicMock, processor: PipelineProcessor, mock_settings: MagicMock) -> None:
-    """Asegura que las páginas excluidas lógicamente por la IA sean rescatadas forzosamente por conservación de masa."""
+    """Asegura que las páginas excluidas lógicamente por la IA sean rescatadas forzosamente."""
     dummy_pdf = mock_settings.raw_dir / "documento_huerfano.pdf"
     dummy_pdf.touch()
 
@@ -128,7 +128,7 @@ def test_pipeline_orphan_catcher_logic(mock_toolbox: MagicMock, processor: Pipel
 
 @patch("src.core.processor.PDFToolbox")
 def test_pipeline_discard_action_skips_processing(mock_toolbox: MagicMock, processor: PipelineProcessor, mock_settings: MagicMock) -> None:
-    """Garantiza que el orquestador aborte la escritura en disco cuando el Repositorio ordena DESCARTAR el registro."""
+    """Garantiza que el orquestador aborte la escritura en disco cuando la BD ordena DESCARTAR."""
     dummy_pdf = mock_settings.raw_dir / "archivo_duplicado.pdf"
     dummy_pdf.touch()
 
@@ -156,27 +156,49 @@ def test_pipeline_discard_action_skips_processing(mock_toolbox: MagicMock, proce
 
 
 @patch("src.core.processor.PDFToolbox")
-def test_pipeline_loose_images_batching(mock_toolbox: MagicMock, processor: PipelineProcessor, mock_settings: MagicMock) -> None:
-    """Verifica que el orquestador divida un conjunto grande de imágenes en lotes secuenciales."""
+def test_pipeline_loose_images_batching_solves_split_batch(mock_toolbox: MagicMock, processor: PipelineProcessor, mock_settings: MagicMock) -> None:
+    """Verifica que el orquestador agrupe lógicamente imágenes procesadas en diferentes lotes (Map-Reduce)."""
+    # Crear 3 imágenes físicas. (Batch size = 2 -> Garantiza 2 Lotes segmentados)
     for i in range(3):
         (mock_settings.raw_dir / f"img_{i}.jpg").touch()
 
     mock_toolbox.wrap_image_to_pdf.side_effect = lambda path, out_dir: out_dir / f"{path.stem}.pdf"
     mock_toolbox.merge_by_folio.return_value = Path("FOLIO_IMG.pdf")
 
-    mock_analysis = AnalysisResponse(documents=[
+    # MOCK: El LLM procesa el Lote 1 e identifica que pertenece al documento FOLIO_IMG
+    mock_analysis_lote1 = AnalysisResponse(documents=[
         LogicalDocument(
             folios=["FOLIO_IMG"],
-            pages=[PageInstruction(file_name="img_0.pdf", rotation_degrees=0)],
+            pages=[PageInstruction(file_name="img_0.pdf", rotation_degrees=0), 
+                   PageInstruction(file_name="img_1.pdf", rotation_degrees=0)],
             document_type="Ticket",
             client_name="N/A",
             confidence_score=95,
-            reasoning="Validado."
+            reasoning="Parte 1."
         )
     ])
-    processor.analyzer.analyze_batch.return_value = mock_analysis
+    
+    # MOCK: El LLM procesa el Lote 2 en el futuro e identifica que TAMBIÉN pertenece a FOLIO_IMG
+    mock_analysis_lote2 = AnalysisResponse(documents=[
+        LogicalDocument(
+            folios=["FOLIO_IMG"], 
+            pages=[PageInstruction(file_name="img_2.pdf", rotation_degrees=0)],
+            document_type="Ticket", 
+            client_name="N/A",
+            confidence_score=95,
+            reasoning="Parte 2."
+        )
+    ])
+    
+    processor.analyzer.analyze_batch.side_effect = [mock_analysis_lote1, mock_analysis_lote2]
 
     results = processor.run()
 
+    # Validamos que se enviaron 2 peticiones HTTP fragmentadas a la IA
     assert processor.analyzer.analyze_batch.call_count == 2
-    assert len(results) > 0
+    
+    # CRÍTICO: Validamos que la fase REDUCE aglomeró ambos lotes en 1 sola entidad física
+    assert len(results) == 1
+    assert results[0]["Páginas Final"] == 3  # 2 páginas (Lote 1) + 1 página (Lote 2)
+    assert "Parte 1." in results[0]["Justificación"]
+    assert "Parte 2." in results[0]["Justificación"]
