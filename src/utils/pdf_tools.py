@@ -29,6 +29,9 @@ class PDFToolbox:
             with fitz.open(str(input_path)) as doc:
                 total_pages = len(doc)
                 
+                # Inyección de progreso físico
+                logger.info(f"[I/O Físico] Explotando archivo '{input_path.name}' ({total_pages} páginas).")
+                
                 for i in range(total_pages):
                     page_num = i + 1
                     new_name = f"{base_name}_P{page_num:03d}_T{total_pages:03d}.pdf"
@@ -52,7 +55,7 @@ class PDFToolbox:
     @staticmethod
     def apply_physical_rotation(pdf_path: Path, degrees: int) -> None:
         """Aplica una rotación física permanente a un archivo PDF en disco.
-        
+
         Garantiza que las siguientes fases operen sobre un artefacto nativamente alineado,
         eliminando la necesidad de transformaciones espaciales durante el reensamblaje.
 
@@ -98,7 +101,7 @@ class PDFToolbox:
     @staticmethod
     def merge_by_folio(pages_data: List[Dict[str, Any]], file_name: str, output_dir: Path) -> Path:
         """Une múltiples PDFs secuencialmente utilizando el nombre exacto proporcionado.
-        
+
         Acepta un diccionario con formato {'path': Path, 'rotation': int}. La rotación
         generalmente será 0 si la mutación física ya fue aplicada previamente.
         Permite sobrescribir el archivo destino si el orquestador determina deduplicación.

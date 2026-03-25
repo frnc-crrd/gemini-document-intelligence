@@ -2,12 +2,13 @@
 
 Adaptado para la arquitectura Map-Reduce. Persiste la memoria global 
 del sistema basándose en la metadata tabular generada tras la 
-Fase Reduce, garantizando la trazabilidad sin acoplarse a modelos estrictos.
+Fase Reduce, garantizando la trazabilidad temporal corregida por zona geográfica.
 """
 
 import json
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -21,6 +22,9 @@ from src.core.logger import get_system_logger
 
 logger = get_system_logger(__name__)
 settings = get_settings()
+
+# Ajuste a la zona horaria de Gómez Palacio, Durango
+tz_local = ZoneInfo("America/Monterrey")
 
 
 class StorageStrategy(ABC):
@@ -108,7 +112,7 @@ class SystemContextManager:
         """Recupera el estado global actual o inicializa uno nuevo si hay un fallo."""
         context = self.storage.load()
         if context is None:
-            logger.info("Retornando estructura base del sistema.")
+            logger.debug("Retornando estructura base del sistema (Contexto inicializado).")
             return self._estructura_base()
         return context
 
@@ -117,35 +121,35 @@ class SystemContextManager:
         contexto = self.obtener_contexto_actual()
         
         lineas = [
-            "=== CONTEXTO HISTÓRICO DEL SISTEMA ===",
-            "Utiliza esta información para resolver ambigüedades."
+            "=== CONTEXTO HISTÓRICO Y REGLAS DE NEGOCIO ===",
+            "Aplica OBLIGATORIAMENTE las siguientes deducciones basadas en el historial del sistema:"
         ]
         
         patrones = contexto.get("patrones_folio", {})
         if patrones:
-            lineas.append("\nPATRONES DE FOLIO CONOCIDOS:")
+            lineas.append("\nPATRONES DE FOLIO ESTRICTOS (PRIORIDAD ALTA):")
             for prefijo, datos in patrones.items():
+                tipo = datos.get("tipo_asociado", "No identificado")
                 ejemplos = ", ".join(datos.get("ejemplos", []))
-                lineas.append(f"  - Prefijo '{prefijo}'. Ejemplos: {ejemplos}")
+                lineas.append(f"  - Si el folio extraído inicia con la letra '{prefijo}' (Ej: {ejemplos}), es ESTRICTAMENTE un(a) '{tipo}'. Usa esta regla si la palabra del documento es borrosa o ilegible.")
 
         clientes = contexto.get("clientes_conocidos", {})
         if clientes:
             lineas.append("\nCLIENTES RECURRENTES:")
-            top_clientes = sorted(clientes.items(), key=lambda item: item[1].get('frecuencia', 0), reverse=True)[:10]
+            top_clientes = sorted(clientes.items(), key=lambda item: item[1].get('frecuencia', 0), reverse=True)[:15]
             for nombre, datos in top_clientes:
-                divisa = datos.get('divisa_comun', 'N/A')
-                lineas.append(f"  - {nombre} (Divisa habitual: {divisa})")
+                lineas.append(f"  - {nombre}")
 
         lineas.append("=== FIN DEL CONTEXTO ===")
         return "\n".join(lineas)
 
     def actualizar_contexto(self, documento_metadata: Dict[str, Any]) -> None:
-        """Procesa un diccionario de resultados consolidados y guarda el estado."""
+        """Procesa un diccionario de resultados consolidados y guarda el estado temporal corregido."""
         ctx = self.obtener_contexto_actual()
         
         ctx.setdefault("estadisticas", {"total_documentos_procesados": 0, "total_folios_extraidos": 0, "total_no_detectados": 0})
         ctx.setdefault("categorias_permitidas", self._estructura_base()["categorias_permitidas"])
-        ctx.setdefault("patrones_folio", {})
+        ctx.setdefault("patrones_folio", self._estructura_base()["patrones_folio"])
         ctx.setdefault("clientes_conocidos", {})
         ctx.setdefault("documentos_recientes", [])
 
@@ -153,7 +157,10 @@ class SystemContextManager:
         
         folio = documento_metadata.get("Folio", "")
         cliente_raw = documento_metadata.get("Cliente", "")
-        divisa = documento_metadata.get("Divisa", "NO_DETECTADA")
+        categoria_cruda = documento_metadata.get("Categoría", "")
+        
+        # Tomamos la categoría principal si hay múltiples (ej. "Factura, Remisión" -> "Factura")
+        categoria_principal = categoria_cruda.split(",")[0].strip() if categoria_cruda else "No identificado"
 
         if folio and not folio.startswith("ERROR") and not folio.startswith("HUERFANO"):
             ctx["estadisticas"]["total_folios_extraidos"] += 1
@@ -162,38 +169,38 @@ class SystemContextManager:
             if letra_inicial:
                 prefijo = letra_inicial[0].upper()
                 if prefijo not in ctx["patrones_folio"]:
-                    ctx["patrones_folio"][prefijo] = {"frecuencia": 0, "ejemplos": []}
+                    ctx["patrones_folio"][prefijo] = {"tipo_asociado": categoria_principal, "frecuencia": 0, "ejemplos": []}
                 
                 ctx["patrones_folio"][prefijo]["frecuencia"] += 1
                 if folio not in ctx["patrones_folio"][prefijo]["ejemplos"]:
                     ctx["patrones_folio"][prefijo]["ejemplos"].append(folio)
-                    ctx["patrones_folio"][prefijo]["ejemplos"] = ctx["patrones_folio"][prefijo]["ejemplos"][-3:]
+                # Mantener solo los últimos 3 ejemplos para no saturar el prompt
+                ctx["patrones_folio"][prefijo]["ejemplos"] = ctx["patrones_folio"][prefijo]["ejemplos"][-3:]
 
             if cliente_raw and cliente_raw != "NO DETECTADO":
                 cliente = cliente_raw.upper()
                 if cliente not in ctx["clientes_conocidos"]:
-                    ctx["clientes_conocidos"][cliente] = {"frecuencia": 0, "divisa_comun": divisa}
+                    ctx["clientes_conocidos"][cliente] = {"frecuencia": 0}
                 ctx["clientes_conocidos"][cliente]["frecuencia"] += 1
-                ctx["clientes_conocidos"][cliente]["divisa_comun"] = divisa
 
             ctx["documentos_recientes"].append({
+                "tipo": categoria_principal,
                 "folio": folio,
                 "cliente": cliente_raw,
-                "divisa": divisa,
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(tz_local).isoformat()
             })
             ctx["documentos_recientes"] = ctx["documentos_recientes"][-20:]
         else:
             ctx["estadisticas"]["total_no_detectados"] += 1
 
-        ctx["ultima_actualizacion"] = datetime.now(timezone.utc).isoformat()
+        ctx["ultima_actualizacion"] = datetime.now(tz_local).isoformat()
         self.storage.save(ctx)
 
     def _estructura_base(self) -> Dict[str, Any]:
-        """Provee un diccionario inmutable con las entidades fundacionales del sistema."""
-        now = datetime.now(timezone.utc).isoformat()
+        """Provee un diccionario inmutable con las entidades fundacionales limpias y las reglas base."""
+        now = datetime.now(tz_local).isoformat()
         return {
-            "version": "2.0",
+            "version": "3.1",
             "creado": now,
             "ultima_actualizacion": now,
             "estadisticas": {
@@ -204,9 +211,14 @@ class SystemContextManager:
             "categorias_permitidas": [
                 "Factura", "Remisión", "Devolución de ventas", "Devolución de compras",
                 "Recepción de mercancía", "Pedido", "Compra", "Orden de compra",
-                "Diarios de ventas", "Nota de remisión", "Ticket", "Recibo", "Otro"
+                "Diarios de ventas", "Ticket", "Recibo", "Otro"
             ],
-            "patrones_folio": {},
+            "patrones_folio": {
+                "A": {"tipo_asociado": "Factura", "frecuencia": 0, "ejemplos": []},
+                "P": {"tipo_asociado": "Factura", "frecuencia": 0, "ejemplos": []},
+                "R": {"tipo_asociado": "Remisión", "frecuencia": 0, "ejemplos": []},
+                "O": {"tipo_asociado": "Orden de compra", "frecuencia": 0, "ejemplos": []}
+            },
             "clientes_conocidos": {},
             "documentos_recientes": []
         }

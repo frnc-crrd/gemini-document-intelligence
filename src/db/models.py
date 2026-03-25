@@ -4,12 +4,15 @@ Mapea la estructura de metadatos documentales hacia el esquema DDL de PostgreSQL
 Garantiza la unicidad y el versionamiento condicionado mediante restricciones compuestas.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import uuid
 from sqlalchemy import Column, String, Integer, DateTime, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base
 
+# Ajuste de Zona Horaria a Gómez Palacio, Durango
+tz_local = ZoneInfo("America/Monterrey")
 Base = declarative_base()
 
 
@@ -34,7 +37,7 @@ class RegistroArtefacto(Base):
     estado_conciliacion = Column(String(50), default='PENDIENTE', index=True)
     id_docto_firebird = Column(String(100), nullable=True)
     
-    fecha_procesamiento = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    fecha_procesamiento = Column(DateTime(timezone=True), default=lambda: datetime.now(tz_local))
 
     __table_args__ = (
         UniqueConstraint('folio', 'categoria', 'version', 'archivo_original', name='uix_folio_categoria_version_origen'),

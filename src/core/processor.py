@@ -1,15 +1,16 @@
 """Orquestador principal del pipeline de integridad documental.
 
 Coordina la ingesta, explosión, análisis contextual paralelo y ensamblaje final.
-Implementa un patrón Map-Reduce estricto para resolver la fragmentación lógica
-de documentos distribuidos en múltiples lotes de visión computacional, garantizando
-la consolidación física antes de la persistencia transaccional.
+Implementa el enrutamiento Multiplex (Dual-Save) para documentos de categoría combinada
+y envía fragmentos sin identificar a la carpeta Revision_Manual_Requerida.
+Garantiza el manejo del estado mediante la correcta disposición de Yields transaccionales.
 """
 
 import re
 import uuid
+import shutil
 from pathlib import Path
-from typing import List, Dict, Any, Set, Optional, Protocol, Tuple
+from typing import List, Dict, Any, Set, Optional, Protocol, Tuple, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz
@@ -31,7 +32,7 @@ class IDocumentAnalyzer(Protocol):
 
 
 class PipelineProcessor:
-    """Controlador central del flujo de trabajo documental basado en Map-Reduce."""
+    """Controlador central del flujo de trabajo documental basado en Map-Reduce iterativo."""
 
     def __init__(self, analyzer: IDocumentAnalyzer, db_repo: Optional[PostgresRepository] = None) -> None:
         self._ensure_directories()
@@ -40,8 +41,19 @@ class PipelineProcessor:
         self.max_workers = settings.max_threads
 
     def _ensure_directories(self) -> None:
-        for directory in [settings.raw_dir, settings.explosion_dir, settings.final_dir]:
+        for directory in [settings.raw_dir, settings.explosion_dir, settings.final_dir, settings.processed_dir]:
             directory.mkdir(parents=True, exist_ok=True)
+
+    def _limpiar_basura_previa(self) -> None:
+        """Purga archivos de sistema locales que no aportan valor algorítmico."""
+        extensiones_basura = {".db", ".ini", ".ds_store"}
+        for archivo in settings.raw_dir.iterdir():
+            if archivo.is_file() and (archivo.suffix.lower() in extensiones_basura or archivo.name.startswith(".")):
+                try:
+                    archivo.unlink()
+                    logger.debug(f"Archivo basura eliminado de la ingesta: {archivo.name}")
+                except OSError as e:
+                    logger.warning(f"Imposible purgar archivo basura {archivo.name}: {e}")
 
     def _sanitize_folder_name(self, name: str) -> str:
         s = re.sub(r'[^\w\s-]', '', name).strip()
@@ -49,57 +61,161 @@ class PipelineProcessor:
 
     def _get_safe_category_dir(self, category_name: str) -> Path:
         """Resuelve y valida la ruta de destino mitigando vulnerabilidades de Path Traversal."""
+        # Rechazo explícito previo a la sanitización
+        if ".." in category_name or "/" in category_name or "\\" in category_name:
+            logger.critical(f"Intento de Path Traversal detectado y bloqueado para categoría: {category_name}")
+            raise ValueError(f"Ruta de destino contiene caracteres de navegación no permitidos: {category_name}")
+
         category_folder = self._sanitize_folder_name(category_name)
         category_dir = (settings.final_dir / category_folder).resolve()
         
         if not category_dir.is_relative_to(settings.final_dir.resolve()):
-            logger.critical(f"Intento de Path Traversal detectado y bloqueado para categoría: {category_name}")
+            logger.critical(f"Validación de frontera fallida para categoría: {category_name}")
             raise ValueError(f"Ruta de destino inválida o maliciosa: {category_dir}")
             
         return category_dir
 
-    def run(self) -> List[Dict[str, Any]]:
-        raw_files = [f for f in settings.raw_dir.iterdir() if f.is_file()]
-        if not raw_files:
-            return []
+    def _mover_a_procesados(self, archivos: List[Path]) -> None:
+        """Traslada físicamente los archivos originales una vez persistidos."""
+        for f_path in archivos:
+            if f_path.exists():
+                dest_path = settings.processed_dir / f_path.name
+                try:
+                    shutil.move(str(f_path), str(dest_path))
+                except Exception as e:
+                    logger.error(f"Fallo al mover documento a procesados {f_path.name}: {e}")
 
-        logger.info(f"Iniciando procesamiento masivo de {len(raw_files)} archivo(s) físico(s) bajo arquitectura Map-Reduce.")
+    def _agrupar_pdfs_por_masa(self, pdf_paths: List[Path], max_pages: int) -> List[List[Path]]:
+        """Algoritmo Greedy Bin Packing para agrupar PDFs garantizando lotes balanceados en memoria."""
+        chunks: List[List[Path]] = []
+        current_chunk: List[Path] = []
+        current_pages = 0
+
+        for path in pdf_paths:
+            try:
+                with fitz.open(str(path)) as doc:
+                    paginas_pdf = len(doc)
+            except Exception as e:
+                logger.error(f"Descartando archivo corrupto de la cola de procesamiento {path.name}: {e}")
+                continue
+
+            if current_chunk and (current_pages + paginas_pdf > max_pages):
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_pages = 0
+
+            current_chunk.append(path)
+            current_pages += paginas_pdf
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    def _agrupar_imagenes_por_lotes_seguros(self, image_paths: List[Path], max_size: int) -> List[List[Path]]:
+        """Aplica una heurística basada en tiempo para evitar dividir un documento multipágina entre lotes."""
+        try:
+            sorted_imgs = sorted(image_paths, key=lambda p: (p.stat().st_mtime, p.name))
+        except OSError:
+            sorted_imgs = sorted(image_paths, key=lambda p: p.name)
+
+        chunks: List[List[Path]] = []
+        current_chunk: List[Path] = []
+
+        for i, img in enumerate(sorted_imgs):
+            current_chunk.append(img)
+            
+            if len(current_chunk) >= max_size:
+                if i + 1 < len(sorted_imgs):
+                    try:
+                        time_diff = abs(sorted_imgs[i+1].stat().st_mtime - img.stat().st_mtime)
+                        if time_diff < 3.0:
+                            continue
+                    except OSError:
+                        pass
+                
+                chunks.append(current_chunk)
+                current_chunk = []
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    def run(self) -> Generator[List[Dict[str, Any]], None, None]:
+        """Ejecuta el procesamiento con enrutamiento inteligente y balanceo de carga."""
+        self._limpiar_basura_previa()
+        
+        raw_files = sorted([f for f in settings.raw_dir.iterdir() if f.is_file()])
+        if not raw_files:
+            return
 
         pdf_files = [f for f in raw_files if f.suffix.lower() == '.pdf']
         image_files = [f for f in raw_files if f.suffix.lower() in ['.jpg', '.jpeg', '.png']]
 
-        mapped_items: List[Dict[str, Any]] = []
+        if pdf_files:
+            logger.info(f"Evaluando topología física de {len(pdf_files)} PDFs para empaquetado dinámico...")
+            pdf_chunks = self._agrupar_pdfs_por_masa(pdf_files, settings.pdf_chunk_max_pages)
+            
+            for idx, chunk in enumerate(pdf_chunks, 1):
+                logger.info(f"--- PROCESANDO LOTE DE PDFs {idx}/{len(pdf_chunks)} ({len(chunk)} archivos balanceados) ---")
+                mapped_items: List[Dict[str, Any]] = []
+                abort_system = False
+                
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    future_to_pdf = {executor.submit(self._map_single_pdf, pdf): pdf for pdf in chunk}
+                    for future in as_completed(future_to_pdf):
+                        pdf_path = future_to_pdf[future]
+                        try:
+                            mapped_items.extend(future.result())
+                        except ConnectionAbortedError:
+                            logger.critical(f"Cortacircuitos activado procesando {pdf_path.name}. Abortando hilo.")
+                            abort_system = True
+                        except Exception as e:
+                            logger.error(f"Fallo catastrófico en el hilo procesando {pdf_path.name}: {e}", exc_info=True)
+                
+                if abort_system:
+                    logger.critical("Interrumpiendo orquestador debido a bloqueo de proveedor de API (Hard Cap 429).")
+                    return
 
-        # MAP: Fase de Inferencia Paralela para PDFs autocontenidos
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_pdf = {executor.submit(self._map_single_pdf, pdf): pdf for pdf in pdf_files}
-            for future in as_completed(future_to_pdf):
-                pdf_path = future_to_pdf[future]
-                try:
-                    mapped_items.extend(future.result())
-                except Exception as e:
-                    logger.error(f"Fallo catastrófico en el hilo procesando {pdf_path.name}: {e}", exc_info=True)
+                final_results = self._shuffle_and_reduce(mapped_items)
+                
+                # Inyección Yield Controlada: Previene mover archivos si la transacción superior falla
+                if final_results:
+                    yield final_results
+                
+                self._mover_a_procesados(chunk)
 
-        # MAP: Fase de Inferencia Secuencial y Segmentada para Imágenes Sueltas
         if image_files:
-            try:
-                mapped_items.extend(self._map_loose_images(image_files))
-            except Exception as e:
-                logger.error(f"Fallo al mapear lote de imágenes: {e}", exc_info=True)
-
-        # REDUCE: Agrupación y Ensamblaje Físico Consolidado
-        final_results = self._shuffle_and_reduce(mapped_items)
-        
-        logger.info(f"Procesamiento Map-Reduce completado. Total de entidades lógicas generadas: {len(final_results)}.")
-        return final_results
+            logger.info(f"Evaluando topología temporal de {len(image_files)} imágenes para empaquetado seguro...")
+            image_chunks = self._agrupar_imagenes_por_lotes_seguros(image_files, settings.physical_chunk_size)
+            
+            for idx, chunk in enumerate(image_chunks, 1):
+                logger.info(f"--- PROCESANDO LOTE DE IMÁGENES {idx}/{len(image_chunks)} ({len(chunk)} archivos aglomerados temporalmente) ---")
+                try:
+                    mapped_items = self._map_loose_images(chunk)
+                    final_results = self._shuffle_and_reduce(mapped_items)
+                    
+                    if final_results:
+                        yield final_results
+                        
+                    self._mover_a_procesados(chunk)
+                except ConnectionAbortedError:
+                    logger.critical("Cortacircuitos activado en flujo fotográfico (Hard Cap 429). Interrumpiendo orquestador para prevenir pérdida de datos.")
+                    return
+                except Exception as e:
+                    logger.error(f"Fallo al procesar lote fotográfico {idx}: {e}", exc_info=True)
 
     def _map_single_pdf(self, file_path: Path) -> List[Dict[str, Any]]:
-        logger.info(f"Iniciando explosión y mapeo de PDF: {file_path.name}")
         try:
             exploded_paths = PDFToolbox.explode_pdf(file_path, settings.explosion_dir)
             if not exploded_paths: 
                 return []
-            return self._map_ai_pipeline(exploded_paths, file_path.name, "PDF")
+            items = self._map_ai_pipeline(exploded_paths, file_path.name, "PDF")
+            logger.info(f"[Mapeo] Finalizado para '{file_path.name}': {len(items)} fragmentos extraídos hacia el orquestador.")
+            return items
+        except ConnectionAbortedError:
+            raise
         except fitz.FileDataError as e:
             logger.error(f"Estructura de PDF corrupta o ilegible al procesar {file_path.name}: {e}")
             return []
@@ -107,22 +223,14 @@ class PipelineProcessor:
             logger.error(f"Error de sistema operativo (I/O) al acceder a {file_path.name}: {e}")
             return []
 
-    def _map_loose_images(self, image_paths: List[Path]) -> List[Dict[str, Any]]:
-        logger.info(f"Iniciando mapeo de {len(image_paths)} imágenes sueltas. Aplicando segmentación por lotes.")
-        
-        try:
-            sorted_images = sorted(image_paths, key=lambda p: (p.stat().st_mtime, p.name))
-        except OSError as e:
-            logger.warning(f"Imposible acceder a metadatos de sistema, ordenando alfabéticamente: {e}")
-            sorted_images = sorted(image_paths, key=lambda p: p.name)
-
+    def _map_loose_images(self, chunk_paths: List[Path]) -> List[Dict[str, Any]]:
         batch_size = settings.vision_batch_size
-        batches = [sorted_images[i:i + batch_size] for i in range(0, len(sorted_images), batch_size)]
+        batches = [chunk_paths[i:i + batch_size] for i in range(0, len(chunk_paths), batch_size)]
         
         mapped_items: List[Dict[str, Any]] = []
 
         for batch_index, current_batch in enumerate(batches, 1):
-            logger.info(f"Mapeando fragmento fotográfico {batch_index}/{len(batches)} (Tamaño: {len(current_batch)} imágenes).")
+            logger.info(f"[Map Fotográfico] Preparando ráfaga API {batch_index}/{len(batches)} (Tamaño: {len(current_batch)} imágenes).")
             exploded_paths: List[Path] = []
             
             for img_path in current_batch:
@@ -135,19 +243,17 @@ class PipelineProcessor:
 
             if not exploded_paths: continue
 
-            # VITAL: Se unifica el origen para permitir que la fase Shuffle agrupe documentos entre lotes distintos
             batch_id = "LOTE_FOTOGRAFICO_CONSOLIDADO"
-            mapped_items.extend(self._map_ai_pipeline(exploded_paths, batch_id, "IMÁGENES MIXTAS"))
+            items = self._map_ai_pipeline(exploded_paths, batch_id, "IMÁGENES MIXTAS")
+            mapped_items.extend(items)
 
         return mapped_items
 
     def _map_ai_pipeline(self, exploded_paths: List[Path], original_file_name: str, original_file_type: str) -> List[Dict[str, Any]]:
-        """Extrae intenciones de ensamblaje desde el motor LLM sin persistir archivos en disco."""
         items = []
         original_page_count = len(exploded_paths)
-        exploded_paths.sort()
+        
         path_map = {p.name: p for p in exploded_paths}
-
         analysis_result = self.analyzer.analyze_batch(exploded_paths, original_file_name)
         used_pages: Set[str] = set()
 
@@ -198,12 +304,10 @@ class PipelineProcessor:
         return items
 
     def _shuffle_and_reduce(self, mapped_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Agrupa intenciones de ensamblaje por folio/categoría y materializa los PDFs finales."""
-        logger.info("Iniciando Fase de Shuffle & Reduce: Agrupando documentos fragmentados.")
+        logger.info(f"[Reduce] Iniciando consolidación física y heurística de {len(mapped_items)} fragmentos.")
         groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
         orphans = []
         
-        # FASE SHUFFLE: Agrupamiento estructurado
         for item in mapped_items:
             if item["is_orphan"]:
                 orphans.append(item)
@@ -218,12 +322,10 @@ class PipelineProcessor:
             
         final_results = []
         
-        # FASE REDUCE: Materialización física e inyección de base de datos
-        for (safe_folio, categoria, origen), items in groups.items():
+        for (safe_folio, categoria_cruda, origen), items in groups.items():
             all_pages = []
             seen_paths = set()
             
-            # Combina páginas respetando el orden cronológico original de los lotes
             for i in items:
                 for p in i["paginas"]:
                     if p["path"] not in seen_paths:
@@ -238,63 +340,66 @@ class PipelineProcessor:
             justificacion_final = " | ".join(justificaciones)
             
             tipo_origen = items[0]["tipo_origen"]
-            original_page_count = sum(i["original_page_count"] for i in items) 
+            original_page_count = items[0]["original_page_count"] if items else 0
             folio_text = items[0]["folio"]
-            
-            try:
-                category_dir = self._get_safe_category_dir(categoria)
-                category_dir.mkdir(exist_ok=True, parents=True)
-            except ValueError as e:
-                logger.error(f"Abortando ensamblaje por violación de seguridad: {e}")
-                continue
-                
             status = "OK" if confianza_final > 80 else "REVISIÓN MANUAL"
-            category_folder = category_dir.name
-            ruta_segura_fallback = f"ERROR_ENSAMBLAJE/{safe_folio}_{uuid.uuid4().hex[:8]}.pdf"
             
-            try:
-                version, accion = self.db_repo.resolve_versioning(
-                    safe_folio, categoria, origen, confianza_final
-                )
+            categorias_destino = [c.strip() for c in categoria_cruda.split(',') if c.strip()]
+            if not categorias_destino:
+                categorias_destino = ["No_identificado"]
                 
-                if accion == "DESCARTAR": continue
+            for cat_individual in categorias_destino:
+                # Asignación segura temprana para evitar UnboundLocalError y proveer entropía única
+                ruta_segura_fallback = f"ERROR_ENSAMBLAJE/{safe_folio}_{uuid.uuid4().hex[:8]}.pdf"
                 
-                file_name = f"{safe_folio}.pdf" if version == 1 else f"{safe_folio}_v{version}.pdf"
-                final_pdf_path = PDFToolbox.merge_by_folio(all_pages, file_name, category_dir)
+                try:
+                    category_dir = self._get_safe_category_dir(cat_individual)
+                    category_dir.mkdir(exist_ok=True, parents=True)
+                    category_folder = category_dir.name
+                    
+                    version, accion = self.db_repo.resolve_versioning(
+                        safe_folio, cat_individual, origen, confianza_final
+                    )
+                    
+                    if accion == "DESCARTAR": continue
+                    
+                    file_name = f"{safe_folio}.pdf" if version == 1 else f"{safe_folio}_v{version}.pdf"
+                    final_pdf_path = PDFToolbox.merge_by_folio(all_pages, file_name, category_dir)
+                    
+                    logger.info(f"[Reduce] Ensamblaje exitoso ({cat_individual}): '{file_name}'.")
+                    
+                    final_results.append({
+                        "Folio": folio_text,
+                        "Versión": version,
+                        "Categoría": cat_individual,
+                        "Cliente": cliente_final,
+                        "Archivo Original": origen,
+                        "Tipo Original": tipo_origen,
+                        "Páginas Original": original_page_count,
+                        "Páginas Final": len(all_pages),
+                        "Status": status,
+                        "Confianza": confianza_final,
+                        "Ruta del Archivo": f"{category_folder}/{final_pdf_path.name}",
+                        "Justificación": justificacion_final
+                    })
+                except Exception as e:
+                    logger.error(f"Fallo al ensamblar documento {cat_individual} para folio {safe_folio}: {e}", exc_info=True)
+                    final_results.append({
+                        "Folio": folio_text,
+                        "Versión": 1,
+                        "Categoría": cat_individual,
+                        "Cliente": cliente_final,
+                        "Archivo Original": origen,
+                        "Páginas Final": 0,
+                        "Status": "ERROR_ENSAMBLAJE",
+                        "Confianza": 0,
+                        "Ruta del Archivo": ruta_segura_fallback,
+                        "Justificación": f"Fallo sistema de archivos: {str(e)}"
+                    })
                 
-                final_results.append({
-                    "Folio": folio_text,
-                    "Versión": version,
-                    "Categoría": categoria,
-                    "Cliente": cliente_final,
-                    "Archivo Original": origen,
-                    "Tipo Original": tipo_origen,
-                    "Páginas Original": original_page_count,
-                    "Páginas Final": len(all_pages),
-                    "Status": status,
-                    "Confianza": confianza_final,
-                    "Ruta del Archivo": f"{category_folder}/{final_pdf_path.name}",
-                    "Justificación": justificacion_final
-                })
-            except Exception as e:
-                logger.error(f"Fallo al ensamblar documento final para folio {safe_folio}: {e}", exc_info=True)
-                final_results.append({
-                    "Folio": folio_text,
-                    "Versión": 1,
-                    "Categoría": categoria,
-                    "Cliente": cliente_final,
-                    "Archivo Original": origen,
-                    "Páginas Final": 0,
-                    "Status": "ERROR_ENSAMBLAJE",
-                    "Confianza": 0,
-                    "Ruta del Archivo": ruta_segura_fallback,
-                    "Justificación": f"Fallo sistema de archivos: {str(e)}"
-                })
-                
-        # Procesamiento aislado para huérfanos (Asegurando conservación de masa)
         if orphans:
             try:
-                orphan_dir = self._get_safe_category_dir("Huerfanos_Rebotes")
+                orphan_dir = self._get_safe_category_dir("Revision_Manual_Requerida")
                 orphan_dir.mkdir(exist_ok=True, parents=True)
                 orphan_folder = orphan_dir.name
             except ValueError:
@@ -310,7 +415,7 @@ class PipelineProcessor:
                     final_results.append({
                         "Folio": settings.error_ilegible,
                         "Versión": 1,
-                        "Categoría": orphan["categoria"],
+                        "Categoría": "Revisión Manual Requerida",
                         "Archivo Original": orphan["origen"],
                         "Páginas Final": 1,
                         "Status": "REVISIÓN MANUAL",
@@ -321,7 +426,7 @@ class PipelineProcessor:
                     final_results.append({
                         "Folio": settings.error_ilegible,
                         "Versión": 1,
-                        "Categoría": orphan["categoria"],
+                        "Categoría": "Revisión Manual Requerida",
                         "Archivo Original": orphan["origen"],
                         "Páginas Final": 0,
                         "Status": "ERROR_ENSAMBLAJE",

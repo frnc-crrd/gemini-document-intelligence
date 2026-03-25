@@ -47,17 +47,7 @@ class PostgresRepository:
             raise
 
     def resolve_versioning(self, folio: str, categoria: str, archivo_original: str, confianza: int) -> Tuple[int, str]:
-        """Aplica la regla de deduplicación vs versionamiento de manera Thread-Safe.
-
-        Args:
-            folio: Identificador extraído del documento.
-            categoria: Tipo lógico del documento detectado.
-            archivo_original: Nombre del archivo de origen.
-            confianza: Nivel de certeza de la extracción.
-
-        Returns:
-            Tuple[int, str]: (Versión a asignar, Acción a tomar ['NUEVO', 'SOBRESCRIBIR', 'DESCARTAR']).
-        """
+        """Aplica la regla de deduplicación vs versionamiento de manera Thread-Safe."""
         cache_key = (folio, categoria)
         
         with self._cache_lock:
@@ -65,7 +55,8 @@ class PostgresRepository:
                 with self.SessionLocal() as session:
                     registros = session.query(RegistroArtefacto).filter_by(folio=folio, categoria=categoria).all()
                     self._version_cache[cache_key] = [
-                        {"origen": r.archivo_original, "version": r.version, "score": r.confianza_promedio}
+                        # Saneamiento estricto contra valores NULL en base de datos
+                        {"origen": r.archivo_original, "version": r.version, "score": r.confianza_promedio or 0}
                         for r in registros
                     ]
             
@@ -86,10 +77,10 @@ class PostgresRepository:
             max_version = max(r["version"] for r in registros_mem)
             new_version = max_version + 1
             self._version_cache[cache_key].append({"origen": archivo_original, "version": new_version, "score": confianza})
-            return new_version, "NUEVO"
+            return new_version, "VERSIONAR"
 
     def upsert_batch(self, batch_data: List[Dict[str, Any]]) -> None:
-        """Delega la inserción masiva y resolución de conflictos al motor de PostgreSQL de forma vectorizada."""
+        """Delega la inserción masiva y resolución de conflictos al motor de PostgreSQL."""
         if not batch_data:
             return
 
@@ -110,8 +101,7 @@ class PostgresRepository:
                 "paginas_consolidado": item.get("Páginas Final", 1),
                 "status": item.get("Status", "PENDIENTE"),
                 "confianza_promedio": item.get("Confianza", 0),
-                "ruta_servidor": item.get("Ruta del Archivo", ""),
-                "justificacion": item.get("Justificación", "")
+                "ruta_servidor": item.get("Ruta del Archivo", "ERROR_RUTA_VACIA")
             })
 
         with self.SessionLocal() as session:
@@ -124,8 +114,7 @@ class PostgresRepository:
                     "paginas_consolidado": stmt.excluded.paginas_consolidado,
                     "status": stmt.excluded.status,
                     "confianza_promedio": stmt.excluded.confianza_promedio,
-                    "ruta_servidor": stmt.excluded.ruta_servidor,
-                    "justificacion": stmt.excluded.justificacion
+                    "ruta_servidor": stmt.excluded.ruta_servidor
                 }
                 
                 stmt = stmt.on_conflict_do_update(
@@ -139,3 +128,4 @@ class PostgresRepository:
             except SQLAlchemyError as e:
                 session.rollback()
                 logger.error(f"Fallo de integridad transaccional al insertar el lote vectorizado. Rollback ejecutado: {e}", exc_info=True)
+                raise
